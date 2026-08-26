@@ -87,6 +87,11 @@ def _install_kconfig_compat():
     _install_kconfig_compat._done = True
 
 
+def _is_clang(cc):
+    base = os.path.basename(cc)
+    return base.startswith("clang") or base.endswith("clang")
+
+
 def load_kconfig(srcdir, arch, cc, ld):
     """Parse the Kconfig tree and return the kconfiglib Kconfig object."""
     import kconfiglib
@@ -98,6 +103,15 @@ def load_kconfig(srcdir, arch, cc, ld):
     os.environ["SRCARCH"] = SRCARCH_MAP.get(arch, arch)
     os.environ["CC"] = cc
     os.environ["LD"] = ld
+    # Mirror scripts/Makefile.clang so clang's integrated assembler is
+    # recognized by scripts/as-version.sh during Kconfig parsing.
+    if _is_clang(cc):
+        flag = "-fno-integrated-as" if os.environ.get("LLVM_IAS") == "0" \
+            else "-fintegrated-as"
+        flags = [f for f in os.environ.get("CLANG_FLAGS", "").split() if f]
+        if flag not in flags:
+            flags.append(flag)
+            os.environ["CLANG_FLAGS"] = " ".join(flags)
     return kconfiglib.Kconfig("Kconfig", warn=False), kconfiglib
 
 
@@ -160,6 +174,9 @@ def sym_defaults(kconfiglib, sym):
             val, cond = entry, kconfiglib.y
         if isinstance(val, kconfiglib.Symbol):
             sval = val.str_value if val.is_constant else val.name
+        elif isinstance(val, tuple):
+            # default value is an expression (e.g. def_bool <expr>)
+            sval = kconfiglib.expr_str(val)
         else:
             sval = str(val)
         cstr = kconfiglib.expr_str(cond)
