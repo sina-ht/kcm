@@ -1,9 +1,9 @@
 # kcm — Linux kernel configuration management tool
 
 `kcm.py` dumps a kernel `.config` to CSV (with metadata parsed from the
-Kconfig tree) for viewing or editing in spreadsheet apps such as Excel, and
-manages per-config memos (annotations) in a separate CSV that persists
-across dumps.
+Kconfig tree) for viewing or editing in spreadsheet apps such as Excel,
+reports the differences between two `.config` files, and manages per-config
+memos (annotations) in a separate CSV that persists across dumps.
 
 ## License
 
@@ -31,6 +31,7 @@ pip install -r requirements.txt
 | `type`    | Kconfig type: `bool`, `tristate`, `string`, `int`, `hex`, `choice` |
 | `title`   | the Kconfig prompt text (e.g. `Local version - append to kernel release`) |
 | `value`   | value from the `.config` (`y`, `n`, number, or string without quotes) |
+| `diff`    | delta against another `.config` (filled by `diff-merge`); empty otherwise |
 | `default` | all Kconfig defaults, `;`-joined; conditional ones as `value if CONDITION` |
 | `depends` | full dependency expression, including enclosing `if` menu context. `<choice>` means "visible when the choice is" |
 | `memo`    | annotation from a memo CSV, or empty                           |
@@ -63,6 +64,52 @@ python3 kcm.py dump --config .config --srcdir linux --memo memo.csv -o dump.csv
 `--arch`/`--cc`/`--ld` only affect parsing of the Kconfig tree (e.g.
 arch-specific `source` paths and `cc-option` probes); they do not change the
 values, which always come from the `.config`.
+
+### diff
+
+Report the differences between two `.config` files as a human-readable list
+on stdout (summary counts go to stderr). `--srcdir` appends the Kconfig title
+of each changed symbol.
+
+```sh
+python3 kcm.py diff --base .config --new .config.new
+python3 kcm.py diff --base .config --new .config.new --srcdir linux
+```
+
+```
+changed (2):
+  CONFIG_KERNEL_GZIP: n -> y
+  CONFIG_IKCONFIG: m -> y
+added (1):
+  CONFIG_RUSTC_HAS_SPAN_FILE: +y
+removed (1):
+  CONFIG_DECOMPRESS_ZSTD: -y
+```
+
+### diff-merge
+
+Fill the `diff` column of an existing dump CSV by comparing each row's
+`value` against a (changed) `.config`. Symbols present only in the new
+`.config` get an appended row, with metadata from the Kconfig tree when
+`--srcdir` is given. Re-running with the same config as before clears
+stale diff cells.
+
+```sh
+python3 kcm.py diff-merge --csv dump.csv --new .config.new --srcdir linux -o dump-diff.csv
+```
+
+Diff cell format: `old -> new` (value changed), `+v` (added in the new
+config), `-v` (removed from it), empty (unchanged).
+
+### diff-split
+
+Extract the non-empty `diff` cells from an annotated CSV into a standalone
+diff CSV (`name,diff` header), so the recorded delta can be kept and
+versioned separately.
+
+```sh
+python3 kcm.py diff-split --csv dump-diff.csv -o diff.csv
+```
 
 ### memo-merge
 
@@ -111,6 +158,22 @@ LOCALVERSION,set to -local for vendor builds
 ```
 
 Duplicate names in a memo CSV: the last entry wins (a warning is printed).
+
+## Diffing configs
+
+After re-generating a `.config` (e.g. via `make menuconfig`), review and
+record what changed:
+
+```sh
+# 1. Review the delta (optionally with Kconfig titles)
+python3 kcm.py diff --base .config --new .config.new --srcdir linux
+
+# 2. Record the delta in the spreadsheet's diff column
+python3 kcm.py diff-merge --csv dump.csv --new .config.new --srcdir linux -o dump-diff.csv
+
+# 3. Persist the delta as a standalone file
+python3 kcm.py diff-split --csv dump-diff.csv -o diff.csv
+```
 
 ## Notes
 
