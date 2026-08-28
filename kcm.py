@@ -5,12 +5,19 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """kcm - Linux kernel configuration management tool.
 
-Dumps .config entries (name, type, title, value, default, depends) to
-CSV for viewing/editing in spreadsheet apps, and manages per-config
-memos (annotations) in a separate persistent CSV.
+Dumps .config entries (name, type, title, value, diff, default, depends)
+to CSV for viewing/editing in spreadsheet apps, reports the differences
+between two .config files, and manages per-config memos (annotations) in
+a separate persistent CSV.
+
+Diff cells (filled by 'diff-merge'): 'old -> new' (value changed), '+v'
+(symbol added in the new config), '-v' (symbol removed from it).
 
 Commands:
   dump        .config + Kconfig tree -> CSV
+  diff        two .config files -> human-readable change report
+  diff-merge  dump CSV + new .config -> CSV with the diff column filled
+  diff-split  dump CSV -> diff.csv (name,diff)
   memo-merge  CSV + memo.csv -> CSV with the memo column filled
   memo-split  annotated CSV -> memo.csv (name,note)
 """
@@ -22,7 +29,7 @@ import os
 import re
 import sys
 
-COLUMNS = ["name", "type", "title", "value", "default", "depends", "memo"]
+COLUMNS = ["name", "type", "title", "value", "diff", "default", "depends", "memo"]
 CONFIG_PREFIX = "CONFIG_"
 
 # Kernel 7.x Kconfig keywords/constructs not (yet) known to kconfiglib.
@@ -278,6 +285,7 @@ def cmd_dump(args):
                 sym_type(kconfiglib, sym),
                 sym_title(sym),
                 strip_quotes(raw),
+                "",
                 sym_defaults(kconfiglib, sym),
                 sym_depends(kconfiglib, sym),
                 memos.get(norm_name(name), ""),
@@ -287,6 +295,154 @@ def cmd_dump(args):
     print(
         "wrote {} rows to {} ({} not found in Kconfig)".format(
             len(rows), args.output or "stdout", unknown
+        ),
+        file=sys.stderr,
+    )
+
+
+def diff_values(base, new):
+    """Compare two config value maps (as from parse_config).
+
+    Returns (name, old, new, kind) records with kind in
+    'changed' / 'added' / 'removed', in base order then new order.
+    """
+    records = []
+    for name, old in base.items():
+        if name not in new:
+            records.append((name, old, "", "removed"))
+        elif new[name] != old:
+            records.append((name, old, new[name], "changed"))
+    for name, newval in new.items():
+        if name not in base:
+            records.append((name, "", newval, "added"))
+    return records
+
+
+def diff_cell(kind, old, new):
+    """Compact diff annotation for one symbol ('' when unchanged)."""
+    if kind == "changed":
+        return "{} -> {}".format(strip_quotes(old), strip_quotes(new))
+    if kind == "added":
+        val = strip_quotes(new)
+        return "+{}".format(val) if val else "+"
+    if kind == "removed":
+        val = strip_quotes(old)
+        return "-{}".format(val) if val else "-"
+    return ""
+
+
+def cmd_diff(args):
+    base = parse_config(args.base)
+    new = parse_config(args.new)
+    titles = {}
+    if args.srcdir:
+        kconf, _ = load_kconfig(args.srcdir, args.arch, args.cc, args.ld)
+        for name in set(base) | set(new):
+            sym = kconf.syms.get(norm_name(name))
+            if sym is not None:
+                titles[name] = sym_title(sym)
+    sections = {"changed": [], "added": [], "removed": []}
+    for name, old, newval, kind in diff_values(base, new):
+        title = titles.get(name, "")
+        sections[kind].append(
+            "  {}: {}{}".format(
+                name,
+                diff_cell(kind, old, newval),
+                "  ({})".format(title) if title else "",
+            )
+        )
+    for kind in ("changed", "added", "removed"):
+        if not sections[kind]:
+            continue
+        print("{} ({}):".format(kind, len(sections[kind])))
+        for line in sections[kind]:
+            print(line)
+    print(
+        "{} changed, {} added, {} removed (base {} symbols, new {} symbols)".format(
+            len(sections["changed"]),
+            len(sections["added"]),
+            len(sections["removed"]),
+            len(base),
+            len(new),
+        ),
+        file=sys.stderr,
+    )
+
+
+def cmd_diff_merge(args):
+    new = {norm_name(k): v for k, v in parse_config(args.new).items()}
+    header, rows = read_table(args.csv)
+    name_i = header.index("name")
+    value_i = header.index("value")
+    diff_i = header.index("diff")
+    counts = {"changed": 0, "added": 0, "removed": 0}
+    known = set()
+    for row in rows:
+        name = norm_name(row[name_i])
+        known.add(name)
+        old_raw = row[value_i]
+        if name not in new:
+            row[diff_i] = diff_cell("removed", old_raw, "")
+            counts["removed"] += 1
+        elif strip_quotes(new[name]) != strip_quotes(old_raw):
+            row[diff_i] = diff_cell("changed", old_raw, new[name])
+            counts["changed"] += 1
+        else:
+            row[diff_i] = ""
+    kconf, kconfiglib = (
+        load_kconfig(args.srcdir, args.arch, args.cc, args.ld)
+        if args.srcdir
+        else (None, None)
+    )
+    for name, raw in new.items():
+        if name in known:
+            continue
+        row = [""] * len(COLUMNS)
+        row[name_i] = CONFIG_PREFIX + name
+        row[value_i] = strip_quotes(raw)
+        row[diff_i] = diff_cell("added", "", raw)
+        if kconf is not None:
+            sym = kconf.syms.get(name)
+            if sym is not None:
+                row[header.index("type")] = sym_type(kconfiglib, sym)
+                row[header.index("title")] = sym_title(sym)
+                row[header.index("default")] = sym_defaults(kconfiglib, sym)
+                row[header.index("depends")] = sym_depends(kconfiglib, sym)
+        rows.append(row)
+        counts["added"] += 1
+    write_table(args.output, rows)
+    print(
+        "{} changed, {} added, {} removed -> {}".format(
+            counts["changed"], counts["added"], counts["removed"],
+            args.output or "stdout",
+        ),
+        file=sys.stderr,
+    )
+
+
+def cmd_diff_split(args):
+    header, rows = read_table(args.csv)
+    diff_i = header.index("diff")
+    name_i = header.index("name")
+    out = sys.stdout if args.output is None or args.output == "-" else open(
+        args.output, "w", newline="", encoding="utf-8"
+    )
+    try:
+        writer = csv.writer(out)
+        writer.writerow(["name", "diff"])
+        count = 0
+        for row in rows:
+            diff = row[diff_i].strip() if diff_i < len(row) else ""
+            name = row[name_i].strip() if name_i < len(row) else ""
+            if name and diff:
+                writer.writerow([name, diff])
+                count += 1
+    finally:
+        if out is not sys.stdout:
+            out.close()
+    print(
+        "split {} diffs from {} rows -> {}".format(
+            count, len(rows), args.output or "stdout"
         ),
         file=sys.stderr,
     )
@@ -339,18 +495,15 @@ def cmd_memo_split(args):
     )
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(
-        prog="kcm", description=__doc__.split("\n\n")[0]
+def _add_kconfig_args(p, srcdir_required=False):
+    p.add_argument(
+        "--srcdir",
+        required=srcdir_required,
+        help="path to kernel source tree",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p = sub.add_parser(
-        "dump", help="dump .config entries to CSV with Kconfig metadata"
+    p.add_argument(
+        "--arch", default="x86_64", help="target architecture (default: x86_64)"
     )
-    p.add_argument("--config", required=True, help="path to .config")
-    p.add_argument("--srcdir", required=True, help="path to kernel source tree")
-    p.add_argument("--arch", default="x86_64", help="target architecture (default: x86_64)")
     p.add_argument(
         "--cc",
         default=os.environ.get("CC", "gcc"),
@@ -361,9 +514,44 @@ def main(argv=None):
         default=os.environ.get("LD", "ld"),
         help="linker used for Kconfig checks (default: $LD or ld)",
     )
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="kcm", description=__doc__.split("\n\n")[0]
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser(
+        "dump", help="dump .config entries to CSV with Kconfig metadata"
+    )
+    p.add_argument("--config", required=True, help="path to .config")
+    _add_kconfig_args(p, srcdir_required=True)
     p.add_argument("--memo", help="memo CSV to pre-fill the memo column")
     p.add_argument("-o", "--output", help="output file (default: stdout)")
     p.set_defaults(func=cmd_dump)
+
+    p = sub.add_parser(
+        "diff", help="human-readable report of the differences between two .config files"
+    )
+    p.add_argument("--base", required=True, help="original .config")
+    p.add_argument("--new", required=True, help="changed .config")
+    _add_kconfig_args(p)
+    p.set_defaults(func=cmd_diff)
+
+    p = sub.add_parser(
+        "diff-merge", help="fill the diff column of a dump CSV against a new .config"
+    )
+    p.add_argument("--csv", required=True, help="dump CSV (from 'dump')")
+    p.add_argument("--new", required=True, help="changed .config")
+    _add_kconfig_args(p)
+    p.add_argument("-o", "--output", help="output file (default: stdout)")
+    p.set_defaults(func=cmd_diff_merge)
+
+    p = sub.add_parser("diff-split", help="extract the diff column to a diff CSV")
+    p.add_argument("--csv", required=True, help="annotated dump CSV")
+    p.add_argument("-o", "--output", help="output diff CSV (default: stdout)")
+    p.set_defaults(func=cmd_diff_split)
 
     p = sub.add_parser("memo-merge", help="fill the memo column of a dump CSV")
     p.add_argument("--csv", required=True, help="dump CSV (from 'dump')")
