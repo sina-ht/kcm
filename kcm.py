@@ -6,9 +6,10 @@
 """kcm - Linux kernel configuration management tool.
 
 Dumps .config entries (name, type, title, value, diff, default, depends)
-to CSV for viewing/editing in spreadsheet apps, reports the differences
-between two .config files, and manages per-config memos (annotations) in
-a separate persistent CSV.
+to CSV or Excel (.xlsx, requires openpyxl) for viewing/editing in
+spreadsheet apps, reports the differences between two .config files (or
+dump tables), and manages per-config memos (annotations) in a separate
+persistent CSV.
 
 Diff cells (filled by 'diff-merge'): 'old -> new' (value changed), '+v'
 (symbol added in the new config), '-v' (symbol removed from it).
@@ -31,6 +32,7 @@ import sys
 
 COLUMNS = ["name", "type", "title", "value", "diff", "default", "depends", "memo"]
 CONFIG_PREFIX = "CONFIG_"
+DEFAULT_SHEET = "config"
 
 # Kernel 7.x Kconfig keywords/constructs not (yet) known to kconfiglib.
 # Bare property lines that can be dropped without changing semantics.
@@ -235,17 +237,38 @@ def load_memo(path):
     return memos
 
 
-def read_table(path):
-    """Read a CSV table, returning (header, rows) with at least COLUMNS present."""
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        rows = [row for row in reader if any(cell.strip() for cell in row)]
-    if not rows:
-        raise SystemExit("error: empty CSV: {}".format(path))
+def _is_xlsx(path):
+    return isinstance(path, str) and path.lower().endswith(".xlsx")
+
+
+def _import_openpyxl():
+    try:
+        import openpyxl
+    except ImportError:
+        raise SystemExit(
+            "error: openpyxl is required for .xlsx files (pip install openpyxl)"
+        )
+    return openpyxl
+
+
+def _cell_str(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _normalize_table(rows):
+    """rows: list of string lists, first row the header.
+
+    Returns (COLUMNS, rows reordered/padded to COLUMNS); a table with no
+    recognizable header is assumed to already be in COLUMNS order.
+    """
     header = [c.strip().lower() for c in rows[0]]
-    missing = [c for c in COLUMNS if c not in header]
-    if missing and "name" not in header:
-        # No recognizable header: assume COLUMNS order
+    if "name" not in header:
         return COLUMNS, [r + [""] * (len(COLUMNS) - len(r)) for r in rows]
     idx = {c: header.index(c) for c in COLUMNS if c in header}
     norm = []
@@ -256,7 +279,109 @@ def read_table(path):
     return COLUMNS, norm
 
 
-def write_table(path, rows):
+def _open_xlsx_sheet(path, sheet, read_only):
+    openpyxl = _import_openpyxl()
+    wb = openpyxl.load_workbook(
+        path, data_only=True, read_only=read_only
+    )
+    if not wb.worksheets:
+        raise SystemExit("error: no sheets in {}".format(path))
+    if sheet is not None:
+        if sheet not in wb.sheetnames:
+            raise SystemExit(
+                "error: no sheet {!r} in {} (sheets: {})".format(
+                    sheet, path, ", ".join(wb.sheetnames)
+                )
+            )
+    ws = wb[sheet] if sheet is not None else wb.worksheets[0]
+    return wb, ws
+
+
+def _first_header(path, sheet):
+    """Lowercased first non-empty row of a table file, or [] if empty."""
+    if _is_xlsx(path):
+        wb, ws = _open_xlsx_sheet(path, sheet, read_only=True)
+        try:
+            for row in ws.iter_rows(values_only=True):
+                if any(v is not None and str(v).strip() for v in row):
+                    return [
+                        str(v).strip().lower() if v is not None else ""
+                        for v in row
+                    ]
+            return []
+        finally:
+            wb.close()
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if any(c.strip() for c in row):
+                return [c.strip().lower() for c in row]
+    return []
+
+
+def read_table(path, sheet=None):
+    """Read a CSV or .xlsx table, returning (COLUMNS, rows in COLUMNS order)."""
+    if _is_xlsx(path):
+        wb, ws = _open_xlsx_sheet(path, sheet, read_only=True)
+        try:
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                cells = [_cell_str(v) for v in row]
+                if any(c.strip() for c in cells):
+                    rows.append(cells)
+        finally:
+            wb.close()
+        if not rows:
+            raise SystemExit("error: empty sheet in {}".format(path))
+        return _normalize_table(rows)
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        rows = [row for row in reader if any(cell.strip() for cell in row)]
+    if not rows:
+        raise SystemExit("error: empty CSV: {}".format(path))
+    return _normalize_table(rows)
+
+
+def _write_table_xlsx(path, rows, sheet):
+    openpyxl = _import_openpyxl()
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    if os.path.exists(path):
+        wb = openpyxl.load_workbook(path)
+        if sheet in wb.sheetnames:
+            del wb[sheet]
+        try:
+            ws = wb.create_sheet(title=sheet)
+        except ValueError as e:
+            raise SystemExit(
+                "error: invalid sheet name {!r}: {}".format(sheet, e)
+            )
+    else:
+        wb = openpyxl.Workbook()
+        try:
+            ws = wb.active
+            ws.title = sheet
+        except ValueError as e:
+            raise SystemExit(
+                "error: invalid sheet name {!r}: {}".format(sheet, e)
+            )
+    ws.append(COLUMNS)
+    for row in rows:
+        ws.append(row)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for i, col in enumerate(COLUMNS, start=1):
+        width = max([len(col)] + [len(str(r[i - 1])) for r in rows])
+        ws.column_dimensions[get_column_letter(i)].width = min(max(width + 2, 8), 60)
+    wb.save(path)
+
+
+def write_table(path, rows, sheet=None):
+    if _is_xlsx(path):
+        _write_table_xlsx(path, rows, sheet or DEFAULT_SHEET)
+        return
     out = sys.stdout if path is None or path == "-" else open(
         path, "w", newline="", encoding="utf-8"
     )
@@ -267,6 +392,23 @@ def write_table(path, rows):
     finally:
         if out is not sys.stdout:
             out.close()
+
+
+def load_config_map(path, sheet=None):
+    """Read CONFIG_NAME -> value from a .config, or a dump table (.csv/.xlsx)."""
+    if _is_xlsx(path) or path.lower().endswith(".csv"):
+        header = _first_header(path, sheet)
+        for col in ("name", "value"):
+            if col not in header:
+                raise SystemExit(
+                    "error: {} does not look like a dump table (no {!r} column)".format(
+                        path, col
+                    )
+                )
+        _, rows = read_table(path, sheet)
+        name_i, value_i = COLUMNS.index("name"), COLUMNS.index("value")
+        return {r[name_i]: r[value_i] for r in rows}
+    return parse_config(path)
 
 
 def cmd_dump(args):
@@ -291,7 +433,7 @@ def cmd_dump(args):
                 memos.get(norm_name(name), ""),
             ]
         )
-    write_table(args.output, rows)
+    write_table(args.output, rows, args.sheet)
     print(
         "wrote {} rows to {} ({} not found in Kconfig)".format(
             len(rows), args.output or "stdout", unknown
@@ -332,8 +474,8 @@ def diff_cell(kind, old, new):
 
 
 def cmd_diff(args):
-    base = parse_config(args.base)
-    new = parse_config(args.new)
+    base = load_config_map(args.base, args.base_sheet)
+    new = load_config_map(args.new, args.new_sheet)
     titles = {}
     if args.srcdir:
         kconf, _ = load_kconfig(args.srcdir, args.arch, args.cc, args.ld)
@@ -371,7 +513,7 @@ def cmd_diff(args):
 
 def cmd_diff_merge(args):
     new = {norm_name(k): v for k, v in parse_config(args.new).items()}
-    header, rows = read_table(args.csv)
+    header, rows = read_table(args.csv, args.sheet)
     name_i = header.index("name")
     value_i = header.index("value")
     diff_i = header.index("diff")
@@ -410,7 +552,7 @@ def cmd_diff_merge(args):
                 row[header.index("depends")] = sym_depends(kconfiglib, sym)
         rows.append(row)
         counts["added"] += 1
-    write_table(args.output, rows)
+    write_table(args.output, rows, args.out_sheet)
     print(
         "{} changed, {} added, {} removed -> {}".format(
             counts["changed"], counts["added"], counts["removed"],
@@ -421,7 +563,7 @@ def cmd_diff_merge(args):
 
 
 def cmd_diff_split(args):
-    header, rows = read_table(args.csv)
+    header, rows = read_table(args.csv, args.sheet)
     diff_i = header.index("diff")
     name_i = header.index("name")
     out = sys.stdout if args.output is None or args.output == "-" else open(
@@ -450,7 +592,7 @@ def cmd_diff_split(args):
 
 def cmd_memo_merge(args):
     memos = load_memo(args.memo)
-    header, rows = read_table(args.csv)
+    header, rows = read_table(args.csv, args.sheet)
     merged = 0
     for row in rows:
         name = norm_name(row[0])
@@ -458,7 +600,7 @@ def cmd_memo_merge(args):
         if note:
             row[header.index("memo")] = note
             merged += 1
-    write_table(args.output, rows)
+    write_table(args.output, rows, args.out_sheet)
     print(
         "merged {} memos into {} rows -> {}".format(
             merged, len(rows), args.output or "stdout"
@@ -468,7 +610,7 @@ def cmd_memo_merge(args):
 
 
 def cmd_memo_split(args):
-    header, rows = read_table(args.csv)
+    header, rows = read_table(args.csv, args.sheet)
     memo_i = header.index("memo")
     name_i = header.index("name")
     out = sys.stdout if args.output is None or args.output == "-" else open(
@@ -493,6 +635,21 @@ def cmd_memo_split(args):
         ),
         file=sys.stderr,
     )
+
+
+def _add_sheet_args(p, with_output=False):
+    """Add sheet-name flags for .xlsx tables."""
+    p.add_argument(
+        "--sheet",
+        help="sheet in the input workbook (default: first sheet; .xlsx only)",
+    )
+    if with_output:
+        p.add_argument(
+            "--out-sheet",
+            help="sheet in the output workbook (default: {}; .xlsx only)".format(
+                DEFAULT_SHEET
+            ),
+        )
 
 
 def _add_kconfig_args(p, srcdir_required=False):
@@ -523,44 +680,75 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser(
-        "dump", help="dump .config entries to CSV with Kconfig metadata"
+        "dump", help="dump .config entries to CSV (or .xlsx) with Kconfig metadata"
     )
     p.add_argument("--config", required=True, help="path to .config")
     _add_kconfig_args(p, srcdir_required=True)
     p.add_argument("--memo", help="memo CSV to pre-fill the memo column")
+    p.add_argument(
+        "--sheet",
+        help="sheet in the output workbook (default: {}; .xlsx only)".format(
+            DEFAULT_SHEET
+        ),
+    )
     p.add_argument("-o", "--output", help="output file (default: stdout)")
     p.set_defaults(func=cmd_dump)
 
     p = sub.add_parser(
-        "diff", help="human-readable report of the differences between two .config files"
+        "diff",
+        help="human-readable report of the differences between two .config files "
+        "(or dump tables)",
     )
-    p.add_argument("--base", required=True, help="original .config")
-    p.add_argument("--new", required=True, help="changed .config")
+    p.add_argument(
+        "--base",
+        required=True,
+        help="original .config, or a dump table (.csv/.xlsx)",
+    )
+    p.add_argument(
+        "--base-sheet", help="sheet in the --base workbook (.xlsx only)"
+    )
+    p.add_argument(
+        "--new",
+        required=True,
+        help="changed .config, or a dump table (.csv/.xlsx)",
+    )
+    p.add_argument(
+        "--new-sheet", help="sheet in the --new workbook (.xlsx only)"
+    )
     _add_kconfig_args(p)
     p.set_defaults(func=cmd_diff)
 
     p = sub.add_parser(
-        "diff-merge", help="fill the diff column of a dump CSV against a new .config"
+        "diff-merge",
+        help="fill the diff column of a dump table against a new .config",
     )
-    p.add_argument("--csv", required=True, help="dump CSV (from 'dump')")
+    p.add_argument("--csv", required=True, help="dump table (.csv or .xlsx, from 'dump')")
     p.add_argument("--new", required=True, help="changed .config")
+    _add_sheet_args(p, with_output=True)
     _add_kconfig_args(p)
     p.add_argument("-o", "--output", help="output file (default: stdout)")
     p.set_defaults(func=cmd_diff_merge)
 
     p = sub.add_parser("diff-split", help="extract the diff column to a diff CSV")
-    p.add_argument("--csv", required=True, help="annotated dump CSV")
+    p.add_argument("--csv", required=True, help="annotated dump table (.csv or .xlsx)")
+    _add_sheet_args(p)
     p.add_argument("-o", "--output", help="output diff CSV (default: stdout)")
     p.set_defaults(func=cmd_diff_split)
 
-    p = sub.add_parser("memo-merge", help="fill the memo column of a dump CSV")
-    p.add_argument("--csv", required=True, help="dump CSV (from 'dump')")
+    p = sub.add_parser(
+        "memo-merge", help="fill the memo column of a dump table"
+    )
+    p.add_argument("--csv", required=True, help="dump table (.csv or .xlsx)")
     p.add_argument("--memo", required=True, help="memo CSV (name,note)")
+    _add_sheet_args(p, with_output=True)
     p.add_argument("-o", "--output", help="output file (default: stdout)")
     p.set_defaults(func=cmd_memo_merge)
 
-    p = sub.add_parser("memo-split", help="extract the memo column to a memo CSV")
-    p.add_argument("--csv", required=True, help="annotated dump CSV")
+    p = sub.add_parser(
+        "memo-split", help="extract the memo column to a memo CSV"
+    )
+    p.add_argument("--csv", required=True, help="annotated dump table (.csv or .xlsx)")
+    _add_sheet_args(p)
     p.add_argument("-o", "--output", help="output memo CSV (default: stdout)")
     p.set_defaults(func=cmd_memo_split)
 
