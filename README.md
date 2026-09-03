@@ -15,6 +15,7 @@ memos (annotations) in a separate CSV that persists across dumps.
 
 - Python 3.9+
 - [kconfiglib](https://github.com/ulfalizer/kconfiglib) >= 14
+- [openpyxl](https://openpyxl.readthedocs.io/) >= 3.1 (only for `.xlsx` files)
 
 ```sh
 pip install -r requirements.txt
@@ -40,15 +41,18 @@ Options present in the `.config` but not in the Kconfig tree (e.g. a newer
 `.config` against an older source tree) get an empty `type`; the count is
 reported on stderr.
 
+The same columns are used for `.xlsx` output (see [Excel workbooks](#excel-workbooks-xlsx)).
+
 ## Commands
 
 ### dump
 
-Parse a `.config` and a kernel source tree, write the CSV.
+Parse a `.config` and a kernel source tree, write the CSV (or `.xlsx`).
 
 ```sh
-python3 kcm.py dump --config <.config> --srcdir <kernel-tree> -o dump.csv
+python3 kcm.py dump --config .config --srcdir linux -o dump.csv
 python3 kcm.py dump --config .config --srcdir linux --memo memo.csv -o dump.csv
+python3 kcm.py dump --config .config --srcdir linux -o book.xlsx --sheet v7.1
 ```
 
 | option     | default      | description                                          |
@@ -56,7 +60,8 @@ python3 kcm.py dump --config .config --srcdir linux --memo memo.csv -o dump.csv
 | `--config` | (required)   | path to the `.config` file                           |
 | `--srcdir` | (required)   | path to the kernel source tree (contains `Kconfig`)  |
 | `--memo`   | none         | memo CSV to pre-fill the `memo` column               |
-| `-o`       | stdout       | output CSV file                                      |
+| `--sheet`  | `config`     | sheet in the output workbook (`.xlsx` only)          |
+| `-o`       | stdout       | output CSV file (or `.xlsx` workbook)                |
 | `--arch`   | `x86_64`     | target architecture (also sets `SRCARCH` correctly)  |
 | `--cc`     | `$CC` or `gcc` | C compiler used for Kconfig `cc-option` checks    |
 | `--ld`     | `$LD` or `ld`  | linker used for Kconfig checks                     |
@@ -71,9 +76,15 @@ Report the differences between two `.config` files as a human-readable list
 on stdout (summary counts go to stderr). `--srcdir` appends the Kconfig title
 of each changed symbol.
 
+`--base`/`--new` also accept dump tables (`.csv` or `.xlsx`) instead of
+`.config` files, detected by extension — e.g. to compare two sheets of the
+same workbook:
+
 ```sh
 python3 kcm.py diff --base .config --new .config.new
 python3 kcm.py diff --base .config --new .config.new --srcdir linux
+python3 kcm.py diff --base book.xlsx --base-sheet before \
+                    --new book.xlsx --new-sheet after
 ```
 
 ```
@@ -96,6 +107,8 @@ stale diff cells.
 
 ```sh
 python3 kcm.py diff-merge --csv dump.csv --new .config.new --srcdir linux -o dump-diff.csv
+python3 kcm.py diff-merge --csv book.xlsx --sheet before --new .config.new \
+  -o book.xlsx --out-sheet before
 ```
 
 Diff cell format: `old -> new` (value changed), `+v` (added in the new
@@ -174,6 +187,41 @@ python3 kcm.py diff-merge --csv dump.csv --new .config.new --srcdir linux -o dum
 # 3. Persist the delta as a standalone file
 python3 kcm.py diff-split --csv dump-diff.csv -o diff.csv
 ```
+
+## Excel workbooks (.xlsx)
+
+All table files (`.csv`) can also be `.xlsx` workbooks, detected by
+extension; `openpyxl` is required for these. A typical workflow keeps one
+workbook per project with one sheet per config snapshot:
+
+```sh
+python3 kcm.py dump --config .config --srcdir linux -o book.xlsx --sheet before
+# ... change the config ...
+python3 kcm.py dump --config .config.new --srcdir linux -o book.xlsx --sheet after
+python3 kcm.py diff --base book.xlsx --base-sheet before --new book.xlsx --new-sheet after
+python3 kcm.py diff-merge --csv book.xlsx --sheet before --new .config.new \
+  -o book.xlsx --out-sheet before
+python3 kcm.py memo-split --csv book.xlsx --sheet after -o memo.csv
+```
+
+How sheets are handled:
+
+- **Writing** (`-o book.xlsx`): a new workbook gets a single sheet; an
+  existing workbook keeps all its other sheets. The sheet name defaults to
+  `config` (`--sheet` for `dump`, `--out-sheet` elsewhere); an existing
+  sheet with that name is replaced. New sheets are appended at the end.
+- **Reading** (`--csv book.xlsx` / `--base` / `--new`): the sheet is given
+  by `--sheet` (or `--base-sheet`/`--new-sheet` for `diff`); without it the
+  **first** sheet of the workbook is used.
+- Sheets written by `kcm` get a bold header row, a frozen first row,
+  autofilter, and sized columns. All cells are written as text.
+- `.xlsx` output requires `-o` (it cannot go to stdout).
+
+Caveats: cells are read back as text, so values survive round trips — but a
+value you *retype* in the Excel UI may be stored as a number (fine for
+integers, lossy for strings with leading zeros). Saving through `kcm`
+preserves data and basic formatting of the other sheets, but exotic content
+(charts, macros, custom drawings) may be degraded by openpyxl.
 
 ## Notes
 
