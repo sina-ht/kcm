@@ -407,8 +407,10 @@ def load_config_map(path, sheet=None):
                 )
         _, rows = read_table(path, sheet)
         name_i, value_i = COLUMNS.index("name"), COLUMNS.index("value")
-        return {r[name_i]: r[value_i] for r in rows}
-    return parse_config(path)
+        return {r[name_i]: strip_quotes(r[value_i]) for r in rows}
+    # .config string values are quoted, table values are not; normalize
+    # both to the unquoted form so the two compare identically.
+    return {k: strip_quotes(v) for k, v in parse_config(path).items()}
 
 
 def cmd_dump(args):
