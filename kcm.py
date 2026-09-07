@@ -14,6 +14,9 @@ persistent CSV.
 Diff cells (filled by 'diff-merge'): 'old -> new' (value changed), '+v'
 (symbol added in the new config), '-v' (symbol removed from it).
 
+'diff-merge' writing to .xlsx also appends one row per changed symbol to
+the workbook's History sheet (date, sheet, name, diff, note).
+
 Commands:
   dump        .config + Kconfig tree -> CSV
   diff        two .config files -> human-readable change report
@@ -29,10 +32,13 @@ import io
 import os
 import re
 import sys
+from datetime import datetime
 
 COLUMNS = ["name", "type", "title", "value", "diff", "default", "depends", "memo"]
 CONFIG_PREFIX = "CONFIG_"
 DEFAULT_SHEET = "config"
+HISTORY_SHEET = "History"
+HISTORY_COLUMNS = ["date", "sheet", "name", "diff", "note"]
 
 # Kernel 7.x Kconfig keywords/constructs not (yet) known to kconfiglib.
 # Bare property lines that can be dropped without changing semantics.
@@ -341,10 +347,36 @@ def read_table(path, sheet=None):
     return _normalize_table(rows)
 
 
-def _write_table_xlsx(path, rows, sheet):
-    openpyxl = _import_openpyxl()
+def _format_sheet(ws, columns, rows):
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
+
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for i, col in enumerate(columns, start=1):
+        width = max([len(col)] + [len(str(r[i - 1])) for r in rows])
+        ws.column_dimensions[get_column_letter(i)].width = min(max(width + 2, 8), 60)
+
+
+def _append_history(wb, entries):
+    """Append (date, sheet, name, diff, note) tuples to the History sheet."""
+    if HISTORY_SHEET in wb.sheetnames:
+        ws = wb[HISTORY_SHEET]
+        for entry in entries:
+            ws.append(entry)
+        ws.auto_filter.ref = ws.dimensions
+    else:
+        ws = wb.create_sheet(title=HISTORY_SHEET)
+        ws.append(HISTORY_COLUMNS)
+        for entry in entries:
+            ws.append(entry)
+        _format_sheet(ws, HISTORY_COLUMNS, entries)
+
+
+def _write_table_xlsx(path, rows, sheet, history=None):
+    openpyxl = _import_openpyxl()
 
     if os.path.exists(path):
         wb = openpyxl.load_workbook(path)
@@ -368,19 +400,15 @@ def _write_table_xlsx(path, rows, sheet):
     ws.append(COLUMNS)
     for row in rows:
         ws.append(row)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    for i, col in enumerate(COLUMNS, start=1):
-        width = max([len(col)] + [len(str(r[i - 1])) for r in rows])
-        ws.column_dimensions[get_column_letter(i)].width = min(max(width + 2, 8), 60)
+    _format_sheet(ws, COLUMNS, rows)
+    if history:
+        _append_history(wb, history)
     wb.save(path)
 
 
-def write_table(path, rows, sheet=None):
+def write_table(path, rows, sheet=None, history=None):
     if _is_xlsx(path):
-        _write_table_xlsx(path, rows, sheet or DEFAULT_SHEET)
+        _write_table_xlsx(path, rows, sheet or DEFAULT_SHEET, history)
         return
     out = sys.stdout if path is None or path == "-" else open(
         path, "w", newline="", encoding="utf-8"
@@ -554,11 +582,26 @@ def cmd_diff_merge(args):
                 row[header.index("depends")] = sym_depends(kconfiglib, sym)
         rows.append(row)
         counts["added"] += 1
-    write_table(args.output, rows, args.out_sheet)
+    history = None
+    if _is_xlsx(args.output) and not args.no_history:
+        out_sheet = args.out_sheet or DEFAULT_SHEET
+        if out_sheet == HISTORY_SHEET:
+            raise SystemExit(
+                "error: cannot record history: the output sheet name "
+                "{!r} collides with the {} sheet".format(out_sheet, HISTORY_SHEET)
+            )
+        now = datetime.now().replace(second=0, microsecond=0)
+        history = [
+            (now, out_sheet, r[name_i], r[diff_i], args.history_note or "")
+            for r in rows
+            if r[diff_i]
+        ]
+    write_table(args.output, rows, args.out_sheet, history)
     print(
-        "{} changed, {} added, {} removed -> {}".format(
+        "{} changed, {} added, {} removed -> {}{}".format(
             counts["changed"], counts["added"], counts["removed"],
             args.output or "stdout",
+            " ({} -> {})".format(len(history), HISTORY_SHEET) if history else "",
         ),
         file=sys.stderr,
     )
@@ -728,6 +771,17 @@ def main(argv=None):
     p.add_argument("--new", required=True, help="changed .config")
     _add_sheet_args(p, with_output=True)
     _add_kconfig_args(p)
+    p.add_argument(
+        "--no-history",
+        action="store_true",
+        help="do not append the changes to the {} sheet (.xlsx output)".format(
+            HISTORY_SHEET
+        ),
+    )
+    p.add_argument(
+        "--history-note",
+        help="note stamped on all {} entries of this run".format(HISTORY_SHEET),
+    )
     p.add_argument("-o", "--output", help="output file (default: stdout)")
     p.set_defaults(func=cmd_diff_merge)
 
