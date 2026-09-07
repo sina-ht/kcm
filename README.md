@@ -109,10 +109,17 @@ stale diff cells.
 python3 kcm.py diff-merge --csv dump.csv --new .config.new --srcdir linux -o dump-diff.csv
 python3 kcm.py diff-merge --csv book.xlsx --sheet before --new .config.new \
   -o book.xlsx --out-sheet before
+python3 kcm.py diff-merge --csv book.xlsx --new .config.new -o book.xlsx \
+  --history-note "switch initramfs compression to LZ4"
 ```
 
 Diff cell format: `old -> new` (value changed), `+v` (added in the new
 config), `-v` (removed from it), empty (unchanged).
+
+When the output is a `.xlsx` workbook, the delta is also appended to the
+workbook's `History` sheet (see [History sheet](#history-sheet)):
+`--no-history` suppresses this, and `--history-note TEXT` stamps a note on
+every entry of the run.
 
 ### diff-split
 
@@ -222,6 +229,26 @@ value you *retype* in the Excel UI may be stored as a number (fine for
 integers, lossy for strings with leading zeros). Saving through `kcm`
 preserves data and basic formatting of the other sheets, but exotic content
 (charts, macros, custom drawings) may be degraded by openpyxl.
+
+## History sheet
+
+`diff-merge` writing to a `.xlsx` workbook appends one row per changed
+symbol to the workbook's `History` sheet:
+
+| column  | meaning                                                        |
+|---------|----------------------------------------------------------------|
+| `date`  | when the `diff-merge` ran (real Excel datetime, local time)    |
+| `sheet` | the table sheet that was updated                               |
+| `name`  | the `CONFIG_` symbol                                           |
+| `diff`  | same format as the diff column: `old -> new`, `+v`, `-v`       |
+| `note`  | from `--history-note`, or empty for manual annotation          |
+
+The sheet is created on first use and only ever grows (one batch per run,
+tagged by date), so it is the persistent record of config changes — data
+sheets are replaced on re-dump, the history is not. A run with no changes
+appends nothing; `--no-history` skips the record entirely. Don't name a
+data sheet `History`: `diff-merge` refuses to record history when the
+output sheet has that name.
 
 ## Notes
 
