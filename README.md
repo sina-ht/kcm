@@ -5,12 +5,6 @@ Kconfig tree) for viewing or editing in spreadsheet apps such as Excel,
 reports the differences between two `.config` files, and manages per-config
 memos (annotations) in a separate CSV that persists across dumps.
 
-## License
-
-- (C)Copyright 2026 by Hiroshi Takekawa
-- SPDX-License-Identifier: GPL-2.0-only
-- Note that the license is GPLv2 only, no later option.
-
 ## Requirements
 
 - Python 3.9+
@@ -150,6 +144,10 @@ python3 kcm.py memo-split --csv dump-annotated.csv -o memo.csv
 ```
 
 ## Typical workflow
+
+For an end-to-end guide to building and maintaining a kernel config as a
+living Excel workbook (baseline, annotation, and change tracking), see
+[WORKFLOW.md](WORKFLOW.md). The minimal CSV round trip is:
 
 ```sh
 # 1. Initial dump (no memos yet)
