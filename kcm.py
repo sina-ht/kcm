@@ -33,11 +33,21 @@ Commands:
   memo-merge   table + memo.csv -> table with the memo column filled
   memo-split   annotated table -> memo.csv (name,note)
   history-split History sheet -> history.csv
+  commit       record the committed->working change and git-commit it
+  history      view the change history: 'log' (list) or 'show <batch>' (detail)
+
+Project file: a .kcmrc (INI, [kcm] section) provides defaults for --config,
+--srcdir, --base, --xlsx, --sheet, --memo, --history, --arch/--cc/--ld; CLI
+flags always win. It is discovered by walking up from the current directory (its
+directory becomes the project root, and relative paths and git run from there).
+Use --rc PATH to name a specific file or --no-rc to disable it.
 """
 
 import argparse
+import configparser
 import csv
 import io
+import json
 import os
 import re
 import subprocess
@@ -60,6 +70,11 @@ HISTORY_COLUMNS = [
     "note",
 ]
 HISTORY_DATE_FMT = "%Y-%m-%d %H:%M"
+
+RC_NAME = ".kcmrc"
+RC_SECTION = "kcm"
+DEFAULT_MEMO = ".kcm-memos.csv"
+DEFAULT_HISTORY = ".kcm-history.csv"
 
 # Kernel 7.x Kconfig keywords/constructs not (yet) known to kconfiglib.
 # Bare property lines that can be dropped without changing semantics.
@@ -205,6 +220,34 @@ def _git_commit(rev):
         )
         return ""
     return proc.stdout.strip()
+
+
+def _run_git(git_args, desc):
+    """Run a git command in the working tree; return its stdout (or error)."""
+    try:
+        proc = subprocess.run(["git"] + git_args, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise SystemExit("error: git is not installed (needed for {})".format(desc))
+    if proc.returncode != 0:
+        raise SystemExit(
+            "error: git {} failed:\n{}".format(
+                " ".join(git_args), proc.stderr.strip()
+            )
+        )
+    return proc.stdout
+
+
+def _git_add(paths):
+    _run_git(["add", "--"] + list(paths), "add")
+
+
+def _git_commit_message(message, signoff=False):
+    """Commit the staged changes with the given message; return the new SHA."""
+    args = ["commit", "-m", message]
+    if signoff:
+        args.append("-s")
+    _run_git(args, "commit")
+    return _run_git(["rev-parse", "HEAD"], "rev-parse").strip()
 
 
 def resolve_config(arg, sibling_path=None):
@@ -645,7 +688,7 @@ def load_config_map(path, sheet=None):
 def cmd_dump(args):
     values = _raw_config_from(resolve_config(args.config))
     kconf, kconfiglib = load_kconfig(args.srcdir, args.arch, args.cc, args.ld)
-    memos = load_memo(args.memo) if args.memo else {}
+    memos = load_memo(args.memo) if (args.memo and os.path.exists(args.memo)) else {}
     if memos:
         _warn_orphan_memos(memos, {norm_name(n) for n in values})
     is_xlsx = _is_xlsx(args.output)
@@ -672,7 +715,11 @@ def cmd_dump(args):
                 memos.get(norm_name(name), ""),
             ]
         )
-    history = load_history(args.history) if (args.history and is_xlsx) else None
+    history = (
+        load_history(args.history)
+        if (args.history and os.path.exists(args.history) and is_xlsx)
+        else None
+    )
     write_table(args.output, rows, args.sheet, history, history_append=False)
     print(
         "wrote {} rows to {} ({} not found in Kconfig)".format(
@@ -726,6 +773,132 @@ def unified_config_patch(old_text, new_text, base_label, new_label):
             n=3,
         )
     )
+
+
+def _apply_config_delta(
+    base, new, base_commit, new_commit, kconf, kconfiglib, memos, sheet, note, now,
+    batch_id,
+):
+    """Build the table rows, change records, counts, and history batch for a
+    config delta. base/new map norm_name -> value (quotes stripped). The table
+    is a view of the current (new) config: one row per symbol, diff column set
+    for this run's changes; removed symbols appear only in the history batch.
+    """
+    name_i = COLUMNS.index("name")
+    value_i = COLUMNS.index("value")
+    diff_i = COLUMNS.index("diff")
+    type_i = COLUMNS.index("type")
+    title_i = COLUMNS.index("title")
+    default_i = COLUMNS.index("default")
+    depends_i = COLUMNS.index("depends")
+    memo_i = COLUMNS.index("memo")
+
+    records = diff_values(base, new)
+    diff_lookup = {r[0]: r for r in records if r[3] in ("changed", "added")}
+
+    rows = []
+    for name, val in new.items():
+        row = [""] * len(COLUMNS)
+        row[name_i] = CONFIG_PREFIX + name
+        row[value_i] = val
+        rec = diff_lookup.get(name)
+        row[diff_i] = diff_cell(rec[3], rec[1], rec[2]) if rec else ""
+        if kconf is not None:
+            sym = kconf.syms.get(name)
+            if sym is not None:
+                row[type_i] = sym_type(kconfiglib, sym)
+                row[title_i] = sym_title(sym)
+                row[default_i] = sym_defaults(kconfiglib, sym)
+                row[depends_i] = sym_depends(kconfiglib, sym)
+        row[memo_i] = memos.get(name, "")
+        rows.append(row)
+
+    counts = {"changed": 0, "added": 0, "removed": 0}
+    for rec in records:
+        counts[rec[3]] += 1
+
+    batch = []
+    for rec in records:
+        cell = diff_cell(rec[3], rec[1], rec[2])
+        if cell:
+            batch.append(
+                [
+                    batch_id,
+                    now,
+                    base_commit,
+                    new_commit,
+                    sheet,
+                    CONFIG_PREFIX + rec[0],
+                    cell,
+                    note,
+                ]
+            )
+    return rows, records, counts, batch
+
+
+def _write_memo_csv(rows, path):
+    """Write a memo CSV (name,note) from table rows; return the entry count."""
+    memo_i = COLUMNS.index("memo")
+    name_i = COLUMNS.index("name")
+    count = 0
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["name", "note"])
+        for row in rows:
+            note = row[memo_i].strip() if memo_i < len(row) else ""
+            name = row[name_i].strip() if name_i < len(row) else ""
+            if name and note:
+                writer.writerow([name, note])
+                count += 1
+    return count
+
+
+def _classify_cell(cell):
+    """Map a diff cell to 'changed'/'added'/'removed' (or None)."""
+    cell = (cell or "").strip()
+    if not cell:
+        return None
+    if cell.startswith("+"):
+        return "added"
+    if cell.startswith("-"):
+        return "removed"
+    if " -> " in cell:
+        return "changed"
+    return None
+
+
+def group_history(rows):
+    """Group history rows by batch id, preserving first-appearance order."""
+    groups = []
+    index = {}
+    for row in rows:
+        bid = row[0]
+        if bid not in index:
+            index[bid] = len(groups)
+            groups.append((bid, []))
+        groups[index[bid]][1].append(row)
+    return groups
+
+
+def batch_summary(batch_id, rows):
+    """Summarize one batch's history rows into a dict."""
+    counts = {"changed": 0, "added": 0, "removed": 0}
+    note = ""
+    for r in rows:
+        kind = _classify_cell(r[6])
+        if kind:
+            counts[kind] += 1
+        if not note and r[7]:
+            note = r[7]
+    return {
+        "batch": batch_id,
+        "date": rows[0][1],
+        "base_commit": rows[0][2],
+        "new_commit": rows[0][3],
+        "sheet": rows[0][4],
+        "note": note,
+        "counts": counts,
+    }
 
 
 def cmd_diff(args):
@@ -807,15 +980,6 @@ def cmd_diff(args):
 
 
 def cmd_diff_merge(args):
-    name_i = COLUMNS.index("name")
-    value_i = COLUMNS.index("value")
-    diff_i = COLUMNS.index("diff")
-    type_i = COLUMNS.index("type")
-    title_i = COLUMNS.index("title")
-    default_i = COLUMNS.index("default")
-    depends_i = COLUMNS.index("depends")
-    memo_i = COLUMNS.index("memo")
-
     new_res = resolve_config(
         args.new,
         sibling_path=(
@@ -836,7 +1000,7 @@ def cmd_diff_merge(args):
             for k, v in _raw_config_from(base_res).items()
         }
         base_commit = base_res["commit"]
-        memos = load_memo(args.memo) if args.memo else {}
+        memos = load_memo(args.memo) if (args.memo and os.path.exists(args.memo)) else {}
     elif args.csv:
         header, trows = read_table(args.csv, args.sheet)
         t_name = header.index("name")
@@ -848,7 +1012,7 @@ def cmd_diff_merge(args):
             if r[t_name].strip()
         }
         base_commit = ""
-        memos = load_memo(args.memo) if args.memo else {
+        memos = load_memo(args.memo) if (args.memo and os.path.exists(args.memo)) else {
             norm_name(r[t_name]): r[t_memo].strip()
             for r in trows
             if r[t_name].strip() and r[t_memo].strip()
@@ -866,56 +1030,17 @@ def cmd_diff_merge(args):
         else (None, None)
     )
 
-    records = diff_values(base, new)
-    diff_lookup = {r[0]: r for r in records if r[3] in ("changed", "added")}
-
-    # The table is a view of the current (--new) config: one row per symbol in
-    # it, with the diff column showing this run's change. Removed symbols are
-    # recorded in the history, not kept as rows.
-    rows = []
-    for name, val in new.items():
-        row = [""] * len(COLUMNS)
-        row[name_i] = CONFIG_PREFIX + name
-        row[value_i] = val
-        rec = diff_lookup.get(name)
-        row[diff_i] = diff_cell(rec[3], rec[1], rec[2]) if rec else ""
-        if kconf is not None:
-            sym = kconf.syms.get(name)
-            if sym is not None:
-                row[type_i] = sym_type(kconfiglib, sym)
-                row[title_i] = sym_title(sym)
-                row[default_i] = sym_defaults(kconfiglib, sym)
-                row[depends_i] = sym_depends(kconfiglib, sym)
-        row[memo_i] = memos.get(name, "")
-        rows.append(row)
-
-    counts = {"changed": 0, "added": 0, "removed": 0}
-    for rec in records:
-        counts[rec[3]] += 1
-
     out_sheet = args.out_sheet or DEFAULT_SHEET
+    batch_id = uuid.uuid4().hex[:12]
+    now = datetime.now().replace(second=0, microsecond=0)
+    note = args.history_note or ""
+    rows, records, counts, batch = _apply_config_delta(
+        base, new, base_commit, new_commit, kconf, kconfiglib, memos, out_sheet,
+        note, now, batch_id,
+    )
+
     sheet_history = None
-    batch = None
     if not args.no_history:
-        batch_id = uuid.uuid4().hex[:12]
-        now = datetime.now().replace(second=0, microsecond=0)
-        note = args.history_note or ""
-        batch = []
-        for rec in records:
-            cell = diff_cell(rec[3], rec[1], rec[2])
-            if cell:
-                batch.append(
-                    [
-                        batch_id,
-                        now,
-                        base_commit,
-                        new_commit,
-                        out_sheet,
-                        CONFIG_PREFIX + rec[0],
-                        cell,
-                        note,
-                    ]
-                )
         if args.history and batch:
             append_history_csv(args.history, batch)
         if _is_xlsx(args.output) and batch:
@@ -927,6 +1052,8 @@ def cmd_diff_merge(args):
                     )
                 )
             sheet_history = batch
+    else:
+        batch = None
 
     write_table(args.output, rows, args.out_sheet, sheet_history, history_append=True)
 
@@ -946,6 +1073,145 @@ def cmd_diff_merge(args):
         ),
         file=sys.stderr,
     )
+
+
+def cmd_commit(args):
+    memo_i = COLUMNS.index("memo")
+
+    new_res = resolve_config(
+        args.new,
+        sibling_path=(
+            args.base if args.base and os.path.exists(args.base) else None
+        ),
+    )
+    if new_res["file"] is None:
+        raise SystemExit(
+            "error: commit's --new must be a worktree config file (not a git "
+            "rev): {!r}".format(args.new)
+        )
+    if args.base:
+        base_res = resolve_config(
+            args.base,
+            sibling_path=(args.new if os.path.exists(args.new) else None),
+        )
+        base = {
+            norm_name(k): strip_quotes(v)
+            for k, v in _raw_config_from(base_res).items()
+        }
+        base_commit = base_res["commit"]
+    else:
+        base = {}
+        base_commit = ""
+    new = {
+        norm_name(k): strip_quotes(v) for k, v in _raw_config_from(new_res).items()
+    }
+    new_commit = new_res["commit"]
+
+    records = diff_values(base, new)
+    if not records:
+        print("no changes to commit (config matches base)", file=sys.stderr)
+        raise SystemExit(0)
+
+    kconf, kconfiglib = (
+        load_kconfig(args.srcdir, args.arch, args.cc, args.ld)
+        if args.srcdir
+        else (None, None)
+    )
+    memos = load_memo(args.memo) if (args.memo and os.path.exists(args.memo)) else {}
+    if args.xlsx and os.path.exists(args.xlsx):
+        # The workbook is the annotator: overlay its memo cells (the most
+        # recent) onto the memo CSV so annotations made in Excel are not lost
+        # when the view is rebuilt below.
+        try:
+            header, trows = read_table(args.xlsx, args.sheet)
+            m_name = header.index("name")
+            m_memo = header.index("memo")
+        except (SystemExit, ValueError):
+            trows = None
+        if trows is not None:
+            for r in trows:
+                name = norm_name(r[m_name])
+                note = r[m_memo].strip()
+                if name and note:
+                    memos[name] = note
+    if memos:
+        _warn_orphan_memos(memos, set(new))
+
+    batch_id = uuid.uuid4().hex[:12]
+    now = datetime.now().replace(second=0, microsecond=0)
+    note = args.note or ""
+    rows, records, counts, batch = _apply_config_delta(
+        base, new, base_commit, new_commit, kconf, kconfiglib, memos, args.sheet,
+        note, now, batch_id,
+    )
+
+    config_path = new_res["file"]
+    has_memos = any(r[memo_i].strip() for r in rows)
+    memo_path = args.memo if (not args.no_memo and has_memos) else None
+    history_path = args.history
+    xlsx_path = args.xlsx
+
+    stage = [config_path, history_path]
+    if memo_path:
+        stage.append(memo_path)
+    if xlsx_path and args.commit_xlsx:
+        stage.append(xlsx_path)
+
+    subject = note if note else "Update {}".format(new_res["label"])
+    message = (
+        "{}\n\n"
+        "kcm-batch: {}\n"
+        "kcm-base:  {}\n"
+        "kcm-delta: {} changed, {} added, {} removed".format(
+            subject,
+            batch_id,
+            base_commit or "(none)",
+            counts["changed"],
+            counts["added"],
+            counts["removed"],
+        )
+    )
+
+    if args.dry_run:
+        print(
+            "dry run: {} changed, {} added, {} removed (batch {})".format(
+                counts["changed"],
+                counts["added"],
+                counts["removed"],
+                batch_id,
+            ),
+            file=sys.stderr,
+        )
+        print("dry run: would stage: {}".format(", ".join(stage)), file=sys.stderr)
+        print("dry run: commit message:\n{}".format(message), file=sys.stderr)
+        raise SystemExit(0)
+
+    append_history_csv(history_path, batch)
+    if xlsx_path:
+        write_table(xlsx_path, rows, args.sheet, batch, history_append=True)
+    if memo_path:
+        _write_memo_csv(rows, memo_path)
+
+    if args.no_git:
+        print(
+            "recorded batch {} ({} changed, {} added, {} removed); "
+            "no git commit (--no-git)".format(
+                batch_id, counts["changed"], counts["added"], counts["removed"]
+            ),
+            file=sys.stderr,
+        )
+        return
+
+    _git_add([p for p in stage if os.path.exists(p)])
+    sha = _git_commit_message(message, signoff=args.signoff)
+    print(
+        "committed batch {}: {} changed, {} added, {} removed".format(
+            batch_id, counts["changed"], counts["added"], counts["removed"]
+        ),
+        file=sys.stderr,
+    )
+    print("  files:  {}".format(", ".join(stage)), file=sys.stderr)
+    print("  commit: {}".format(sha), file=sys.stderr)
 
 
 def cmd_diff_split(args):
@@ -1075,6 +1341,172 @@ def cmd_history_split(args):
     )
 
 
+def cmd_history_log(args):
+    if not os.path.exists(args.history):
+        raise SystemExit("error: no history file: {}".format(args.history))
+    rows = load_history(args.history)
+    ordered = group_history(rows)
+    if not getattr(args, "reverse", False):
+        ordered = list(reversed(ordered))
+    limit = getattr(args, "limit", 0)
+    if limit:
+        ordered = ordered[:limit]
+
+    if getattr(args, "json", False):
+        out = []
+        for bid, brows in ordered:
+            s = batch_summary(bid, brows)
+            out.append(
+                {
+                    "batch": s["batch"],
+                    "date": s["date"].strftime(HISTORY_DATE_FMT),
+                    "base_commit": s["base_commit"],
+                    "new_commit": s["new_commit"],
+                    "sheet": s["sheet"],
+                    "note": s["note"],
+                    "counts": s["counts"],
+                }
+            )
+        print(json.dumps(out, indent=2))
+        return
+
+    if getattr(args, "long", False):
+        for bid, brows in ordered:
+            s = batch_summary(bid, brows)
+            c = s["counts"]
+            print(s["batch"])
+            print("  date   {}".format(s["date"].strftime(HISTORY_DATE_FMT)))
+            print("  base   {}".format(s["base_commit"] or "-"))
+            print("  new    {}".format(s["new_commit"] or "-"))
+            print("  sheet  {}".format(s["sheet"]))
+            print(
+                "  counts {} changed, {} added, {} removed".format(
+                    c["changed"], c["added"], c["removed"]
+                )
+            )
+            print("  note   {}".format(s["note"] or "-"))
+            print()
+        return
+
+    for bid, brows in ordered:
+        s = batch_summary(bid, brows)
+        c = s["counts"]
+        base = s["base_commit"][:7] if s["base_commit"] else "-"
+        new = s["new_commit"][:7] if s["new_commit"] else "-"
+        note = "  {}".format(s["note"]) if s["note"] else ""
+        print(
+            "{}  {}  base={}  new={}  {}c {}a {}r{}".format(
+                s["batch"],
+                s["date"].strftime(HISTORY_DATE_FMT),
+                base,
+                new,
+                c["changed"],
+                c["added"],
+                c["removed"],
+                note,
+            )
+        )
+
+
+def _batch_patch(args, s):
+    """Rebuild a git unified diff for one batch from its stored refs."""
+    config = getattr(args, "config", None)
+    if not config:
+        raise SystemExit(
+            "error: --patch needs a config path (set 'config' in .kcmrc or "
+            "pass --config)"
+        )
+    base_ref = args.base
+    if not base_ref:
+        if not s["base_commit"]:
+            raise SystemExit("error: --patch needs a base ref (pass --base)")
+        base_ref = "{}:{}".format(s["base_commit"], config)
+    if args.new:
+        new_ref = args.new
+    elif s["new_commit"]:
+        new_ref = "{}:{}".format(s["new_commit"], config)
+    else:
+        new_ref = "HEAD:{}".format(config)
+    base_res = resolve_config(base_ref, sibling_path=config)
+    new_res = resolve_config(new_ref, sibling_path=config)
+    return unified_config_patch(
+        _source_text(base_res), _source_text(new_res), base_res["label"],
+        new_res["label"],
+    )
+
+
+def cmd_history_show(args):
+    if not os.path.exists(args.history):
+        raise SystemExit("error: no history file: {}".format(args.history))
+    rows = load_history(args.history)
+    groups = group_history(rows)
+    target_bid = None
+    target_rows = None
+    for bid, brows in groups:
+        if bid == args.batch or (
+            len(args.batch) >= 4 and bid.startswith(args.batch)
+        ):
+            target_bid = bid
+            target_rows = brows
+            break
+    if target_rows is None:
+        avail = [bid for bid, _ in groups]
+        raise SystemExit(
+            "error: no batch {!r} in {} ({} batch(es): {})".format(
+                args.batch,
+                args.history,
+                len(avail),
+                ", ".join(avail) if avail else "none",
+            )
+        )
+    s = batch_summary(target_bid, target_rows)
+    patch = _batch_patch(args, s) if args.patch else None
+
+    if getattr(args, "json", False):
+        obj = {
+            "batch": s["batch"],
+            "date": s["date"].strftime(HISTORY_DATE_FMT),
+            "base_commit": s["base_commit"],
+            "new_commit": s["new_commit"],
+            "sheet": s["sheet"],
+            "note": s["note"],
+            "counts": s["counts"],
+            "changes": [{"name": r[5], "diff": r[6]} for r in target_rows],
+        }
+        if args.patch:
+            obj["patch"] = patch
+        print(json.dumps(obj, indent=2))
+        return
+
+    c = s["counts"]
+    # With --patch the patch is the clean stdout; the human report moves to
+    # stderr. Otherwise the report is the stdout output (like `diff`).
+    report = sys.stderr if args.patch else sys.stdout
+    print("batch   {}".format(s["batch"]), file=report)
+    print("date    {}".format(s["date"].strftime(HISTORY_DATE_FMT)), file=report)
+    print(
+        "base    {}   new    {}".format(
+            s["base_commit"] or "-", s["new_commit"] or "-"
+        ),
+        file=report,
+    )
+    print(
+        "sheet   {}   note   {}".format(s["sheet"], s["note"] or "-"), file=report
+    )
+    print(
+        "counts  {} changed, {} added, {} removed".format(
+            c["changed"], c["added"], c["removed"]
+        ),
+        file=report,
+    )
+    print(file=report)
+    for r in target_rows:
+        extra = "  ({})".format(r[7]) if (r[7] and r[7] != s["note"]) else ""
+        print("{:<32} {}{}".format(r[5], r[6], extra), file=report)
+    if args.patch and patch:
+        print(patch, end="")
+
+
 def _add_sheet_args(p, with_output=False):
     """Add sheet-name flags for .xlsx tables."""
     p.add_argument(
@@ -1091,39 +1523,216 @@ def _add_sheet_args(p, with_output=False):
 
 
 def _add_kconfig_args(p, srcdir_required=False):
+    # srcdir/arch/cc/ld default to None here so .kcmrc can supply them; the
+    # built-in defaults are applied in apply_project_defaults().
     p.add_argument(
         "--srcdir",
-        required=srcdir_required,
+        default=None,
         help="path to kernel source tree",
     )
     p.add_argument(
-        "--arch", default="x86_64", help="target architecture (default: x86_64)"
+        "--arch",
+        default=None,
+        help="target architecture (default: x86_64)",
     )
     p.add_argument(
         "--cc",
-        default=os.environ.get("CC", "gcc"),
+        default=None,
         help="C compiler used for Kconfig checks (default: $CC or gcc)",
     )
     p.add_argument(
         "--ld",
-        default=os.environ.get("LD", "ld"),
+        default=None,
         help="linker used for Kconfig checks (default: $LD or ld)",
     )
 
 
+def discover_project(cwd):
+    """Walk up from cwd looking for .kcmrc; return (path or None, root)."""
+    d = os.path.abspath(cwd)
+    while True:
+        rc = os.path.join(d, RC_NAME)
+        if os.path.isfile(rc):
+            return rc, d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None, cwd
+        d = parent
+
+
+def load_kcmrc(path):
+    """Read a .kcmrc INI file -> dict of the [kcm] section (lowercased keys)."""
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        with open(path, encoding="utf-8") as f:
+            cp.read_file(f)
+    except (configparser.Error, OSError) as e:
+        raise SystemExit("error: bad {} {!r}: {}".format(RC_NAME, path, e))
+    if not cp.has_section(RC_SECTION):
+        return {}
+    return {k: v for k, v in cp[RC_SECTION].items() if v.strip()}
+
+
+def setup_project(args):
+    """Resolve the project (rc + root) and chdir to the root. -> (rc, root).
+
+    --no-rc disables discovery; --rc names a specific file. With no rc the
+    root is the CWD and behavior is unchanged.
+    """
+    cwd = os.getcwd()
+    if getattr(args, "no_rc", False):
+        return {}, cwd
+    rc_path = None
+    root = cwd
+    if getattr(args, "rc", None):
+        p = os.path.abspath(args.rc)
+        if not os.path.isfile(p):
+            raise SystemExit("error: no such file: {}".format(args.rc))
+        rc_path = p
+        root = os.path.dirname(p)
+    else:
+        rc_path, root = discover_project(cwd)
+    if rc_path is not None:
+        os.chdir(root)
+        return load_kcmrc(rc_path), root
+    return {}, cwd
+
+
+def apply_project_defaults(args, rc):
+    """Fill unset args from .kcmrc, then apply built-in defaults and check
+    required values. Precedence: CLI flag > .kcmrc > built-in."""
+
+    def d(key):
+        v = rc.get(key)
+        return v if v not in (None, "") else None
+
+    if hasattr(args, "arch"):
+        args.arch = args.arch or d("arch") or "x86_64"
+    if hasattr(args, "cc"):
+        args.cc = args.cc or d("cc") or os.environ.get("CC") or "gcc"
+    if hasattr(args, "ld"):
+        args.ld = args.ld or d("ld") or os.environ.get("LD") or "ld"
+    if hasattr(args, "srcdir"):
+        args.srcdir = args.srcdir or d("srcdir")
+
+    cmd = args.command
+    cfg = d("config")
+
+    if cmd == "dump":
+        args.config = args.config or cfg
+        args.sheet = args.sheet or d("sheet")
+        args.memo = args.memo or d("memo")
+        args.history = args.history or d("history")
+        args.output = args.output or d("xlsx")
+        if not args.config:
+            raise SystemExit(
+                "error: dump needs --config (or 'config' in {})".format(RC_NAME)
+            )
+        if not args.srcdir:
+            raise SystemExit(
+                "error: dump needs --srcdir (or 'srcdir' in {})".format(RC_NAME)
+            )
+
+    elif cmd == "diff":
+        args.new = args.new or cfg
+        if args.base is None and cfg is not None:
+            args.base = "HEAD:{}".format(cfg)
+        args.base_sheet = args.base_sheet or d("sheet")
+        args.new_sheet = args.new_sheet or d("sheet")
+        if not args.base:
+            raise SystemExit(
+                "error: diff needs --base (or 'config' in {} for "
+                "HEAD:config)".format(RC_NAME)
+            )
+        if not args.new:
+            raise SystemExit(
+                "error: diff needs --new (or 'config' in {})".format(RC_NAME)
+            )
+
+    elif cmd == "diff-merge":
+        args.new = args.new or cfg
+        if not args.csv and args.base is None and cfg is not None:
+            args.base = "HEAD:{}".format(cfg)
+        args.sheet = args.sheet or d("sheet")
+        args.out_sheet = args.out_sheet or d("sheet")
+        args.memo = args.memo or d("memo")
+        args.history = args.history or d("history")
+        args.output = args.output or d("xlsx")
+        if not args.new:
+            raise SystemExit(
+                "error: diff-merge needs --new (or 'config' in {})".format(RC_NAME)
+            )
+        if not args.csv and not args.base:
+            raise SystemExit(
+                "error: diff-merge needs --base (or 'config' in {} for "
+                "HEAD:config) or --csv".format(RC_NAME)
+            )
+
+    elif cmd in ("diff-split", "memo-merge", "memo-split", "history-split"):
+        args.csv = args.csv or d("xlsx")
+        if cmd in ("diff-split", "memo-merge", "memo-split"):
+            args.sheet = args.sheet or d("sheet")
+        if cmd == "memo-merge":
+            args.memo = args.memo or d("memo")
+        if not args.csv:
+            raise SystemExit(
+                "error: {} needs --csv (or 'xlsx' in {})".format(cmd, RC_NAME)
+            )
+
+    elif cmd == "commit":
+        if not args.new:
+            args.new = d("config")
+        if not args.config:
+            args.config = args.new
+        if args.base is None and args.config:
+            args.base = "HEAD:{}".format(args.config)
+        args.sheet = args.sheet or d("sheet") or DEFAULT_SHEET
+        args.xlsx = args.xlsx or d("xlsx")
+        args.memo = args.memo or d("memo") or DEFAULT_MEMO
+        args.history = args.history or d("history") or DEFAULT_HISTORY
+        if not args.new:
+            raise SystemExit(
+                "error: commit needs --new (or 'config' in {})".format(RC_NAME)
+            )
+
+    elif cmd == "history":
+        args.history = args.history or d("history") or DEFAULT_HISTORY
+        if hasattr(args, "config"):
+            args.config = args.config or d("config")
+
+
+def _add_rc_args(p):
+    p.add_argument(
+        "--rc",
+        help="path to a {} file (default: discovered by walking up from "
+        "CWD)".format(RC_NAME),
+    )
+    p.add_argument(
+        "--no-rc", action="store_true", help="do not use a {} file".format(RC_NAME)
+    )
+
+
 def main(argv=None):
+    rc_parent = argparse.ArgumentParser(add_help=False)
+    _add_rc_args(rc_parent)
+
     parser = argparse.ArgumentParser(
-        prog="kcm", description=__doc__.split("\n\n")[0]
+        prog="kcm",
+        description=__doc__.split("\n\n")[0],
+        parents=[rc_parent],
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser(
-        "dump", help="dump .config entries to CSV (or .xlsx) with Kconfig metadata"
+        "dump",
+        help="dump .config entries to CSV (or .xlsx) with Kconfig metadata",
+        parents=[rc_parent],
     )
     p.add_argument(
         "--config",
-        required=True,
-        help="path to .config (or a git rev <ref>[:<path>])",
+        default=None,
+        help="path to .config (or a git rev <ref>[:<path>]); "
+        "defaults to 'config' in .kcmrc",
     )
     _add_kconfig_args(p, srcdir_required=True)
     p.add_argument("--memo", help="memo CSV to pre-fill the memo column")
@@ -1144,21 +1753,22 @@ def main(argv=None):
         "diff",
         help="human-readable report of the differences between two .config files "
         "(or dump tables)",
+        parents=[rc_parent],
     )
     p.add_argument(
         "--base",
-        required=True,
+        default=None,
         help="original .config (or a git rev <ref>[:<path>]), or a dump table "
-        "(.csv/.xlsx)",
+        "(.csv/.xlsx); defaults to HEAD:<config>",
     )
     p.add_argument(
         "--base-sheet", help="sheet in the --base workbook (.xlsx only)"
     )
     p.add_argument(
         "--new",
-        required=True,
+        default=None,
         help="changed .config (or a git rev <ref>[:<path>]), or a dump table "
-        "(.csv/.xlsx)",
+        "(.csv/.xlsx); defaults to 'config' in .kcmrc",
     )
     p.add_argument(
         "--new-sheet", help="sheet in the --new workbook (.xlsx only)"
@@ -1176,11 +1786,12 @@ def main(argv=None):
     p = sub.add_parser(
         "diff-merge",
         help="update a dump table against a new config and record the change",
+        parents=[rc_parent],
     )
     p.add_argument(
         "--base",
         help="original config (text .config or a git rev <ref>[:<path>]); "
-        "pairs with --new for the delta",
+        "pairs with --new for the delta; defaults to HEAD:<config>",
     )
     p.add_argument(
         "--csv",
@@ -1188,8 +1799,9 @@ def main(argv=None):
     )
     p.add_argument(
         "--new",
-        required=True,
-        help="changed config (text .config or a git rev <ref>[:<path>])",
+        default=None,
+        help="changed config (text .config or a git rev <ref>[:<path>]); "
+        "defaults to 'config' in .kcmrc",
     )
     p.add_argument(
         "--memo",
@@ -1213,25 +1825,47 @@ def main(argv=None):
     p.add_argument("-o", "--output", help="output file (default: stdout)")
     p.set_defaults(func=cmd_diff_merge)
 
-    p = sub.add_parser("diff-split", help="extract the diff column to a diff CSV")
-    p.add_argument("--csv", required=True, help="annotated dump table (.csv or .xlsx)")
+    p = sub.add_parser(
+        "diff-split",
+        help="extract the diff column to a diff CSV",
+        parents=[rc_parent],
+    )
+    p.add_argument(
+        "--csv",
+        default=None,
+        help="annotated dump table (.csv or .xlsx); defaults to 'xlsx' in .kcmrc",
+    )
     _add_sheet_args(p)
     p.add_argument("-o", "--output", help="output diff CSV (default: stdout)")
     p.set_defaults(func=cmd_diff_split)
 
     p = sub.add_parser(
-        "memo-merge", help="fill the memo column of a dump table"
+        "memo-merge",
+        help="fill the memo column of a dump table",
+        parents=[rc_parent],
     )
-    p.add_argument("--csv", required=True, help="dump table (.csv or .xlsx)")
-    p.add_argument("--memo", required=True, help="memo CSV (name,note)")
+    p.add_argument(
+        "--csv",
+        default=None,
+        help="dump table (.csv or .xlsx); defaults to 'xlsx' in .kcmrc",
+    )
+    p.add_argument(
+        "--memo", default=None, help="memo CSV (name,note); defaults to 'memo' in .kcmrc"
+    )
     _add_sheet_args(p, with_output=True)
     p.add_argument("-o", "--output", help="output file (default: stdout)")
     p.set_defaults(func=cmd_memo_merge)
 
     p = sub.add_parser(
-        "memo-split", help="extract the memo column to a memo CSV"
+        "memo-split",
+        help="extract the memo column to a memo CSV",
+        parents=[rc_parent],
     )
-    p.add_argument("--csv", required=True, help="annotated dump table (.csv or .xlsx)")
+    p.add_argument(
+        "--csv",
+        default=None,
+        help="annotated dump table (.csv or .xlsx); defaults to 'xlsx' in .kcmrc",
+    )
     _add_sheet_args(p)
     p.add_argument("-o", "--output", help="output memo CSV (default: stdout)")
     p.set_defaults(func=cmd_memo_split)
@@ -1239,16 +1873,141 @@ def main(argv=None):
     p = sub.add_parser(
         "history-split",
         help="extract the {} sheet of a workbook to a history CSV".format(HISTORY_SHEET),
+        parents=[rc_parent],
     )
     p.add_argument(
         "--csv",
-        required=True,
-        help="workbook (.xlsx) with a {} sheet".format(HISTORY_SHEET),
+        default=None,
+        help="workbook (.xlsx) with a {} sheet; defaults to 'xlsx' in "
+        ".kcmrc".format(HISTORY_SHEET),
     )
     p.add_argument("-o", "--output", help="output history CSV (default: stdout)")
     p.set_defaults(func=cmd_history_split)
 
+    p = sub.add_parser(
+        "commit",
+        help="record the committed->working change and git-commit it "
+        "(workbook + memos + history + config)",
+        parents=[rc_parent],
+    )
+    p.add_argument(
+        "--config",
+        help="worktree config file to commit (default: 'config' in .kcmrc, "
+        "or --new)",
+    )
+    p.add_argument(
+        "--new",
+        help="current config to read (default: 'config' in .kcmrc)",
+    )
+    p.add_argument(
+        "--base",
+        help="config to diff against (default: HEAD:<config>)",
+    )
+    p.add_argument("--note", help="note for this batch / commit subject")
+    p.add_argument(
+        "--signoff",
+        "-s",
+        action="store_true",
+        help="add a Signed-off-by line to the commit",
+    )
+    p.add_argument(
+        "--xlsx", help="workbook to update (view of the state); written locally"
+    )
+    p.add_argument(
+        "--commit-xlsx",
+        action="store_true",
+        help="also git-stage/commit the workbook (a derived binary; off by default)",
+    )
+    p.add_argument(
+        "--sheet",
+        help="sheet in the output workbook (default: {}; .xlsx only)".format(
+            DEFAULT_SHEET
+        ),
+    )
+    p.add_argument("--memo", help="memo CSV to refresh and commit")
+    p.add_argument("--history", help="history CSV to append and commit")
+    _add_kconfig_args(p)
+    p.add_argument(
+        "--no-git",
+        action="store_true",
+        help="write the memos/history/workbook but do not run git",
+    )
+    p.add_argument(
+        "--no-memo",
+        action="store_true",
+        help="do not refresh the memo CSV",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report the change without writing files or running git",
+    )
+    p.set_defaults(func=cmd_commit)
+
+    hist_parent = argparse.ArgumentParser(add_help=False)
+    hist_parent.add_argument(
+        "--history",
+        help="history CSV (default: 'history' in .kcmrc or {})".format(
+            DEFAULT_HISTORY
+        ),
+    )
+    hist_parent.add_argument(
+        "--json", action="store_true", help="emit JSON on stdout"
+    )
+
+    p = sub.add_parser(
+        "history",
+        help="view the change history (log) or one batch (show)",
+        parents=[rc_parent, hist_parent],
+    )
+    p.set_defaults(func=cmd_history_log)
+    hsub = p.add_subparsers(dest="history_command")
+
+    pl = hsub.add_parser(
+        "log", help="list batches (default for 'history')", parents=[hist_parent]
+    )
+    pl.add_argument(
+        "--limit", type=int, help="show only the N most recent batches"
+    )
+    pl.add_argument(
+        "--reverse",
+        action="store_true",
+        help="oldest first (default: newest first)",
+    )
+    pl.add_argument(
+        "--long",
+        action="store_true",
+        help="one block per batch instead of one line each",
+    )
+    pl.set_defaults(func=cmd_history_log)
+
+    ps = hsub.add_parser(
+        "show", help="show one batch's per-symbol changes", parents=[hist_parent]
+    )
+    ps.add_argument("batch", help="batch id (full or unique prefix)")
+    ps.add_argument(
+        "--patch",
+        action="store_true",
+        help="also emit a git unified diff of the batch",
+    )
+    ps.add_argument(
+        "--base",
+        help="base ref/path for --patch (default: <base_commit>:<config>)",
+    )
+    ps.add_argument(
+        "--new",
+        help="new ref/path for --patch (default: <new_commit>:<config>, "
+        "else HEAD:<config>)",
+    )
+    ps.add_argument(
+        "--config",
+        help="config path for --patch (default: 'config' in .kcmrc)",
+    )
+    ps.set_defaults(func=cmd_history_show)
+
     args = parser.parse_args(argv)
+    rc, _root = setup_project(args)
+    apply_project_defaults(args, rc)
     args.func(args)
 
 
