@@ -101,13 +101,12 @@ cd ..
 ```
 
 The config on disk is now the *new* state; the committed one at `HEAD` is the
-*base*. Extract the base and record the change — rebuild the view, fill the
+*base*. Record the change straight against git — rebuild the view, fill the
 `diff` column, and append a labeled batch to the history (both `history.csv`
-and the `History` sheet):
+and the `History` sheet); the base commit is stamped automatically:
 
 ```sh
-git show HEAD:linux/.config > /tmp/config.base
-python3 kcm.py diff-merge --base /tmp/config.base --new linux/.config \
+python3 kcm.py diff-merge --base HEAD:linux/.config --new linux/.config \
   --srcdir linux --memo memos.csv --history history.csv \
   --history-note "attack-surface: disable unused filesystems, drivers, networking" \
   -o kernel.xlsx
@@ -138,8 +137,7 @@ Repeat the loop, and capture the requirement's rationale in the memos.
 2. Record it, naming the requirement in the history note:
 
    ```sh
-   git show HEAD:linux/.config > /tmp/config.base
-   python3 kcm.py diff-merge --base /tmp/config.base --new linux/.config \
+   python3 kcm.py diff-merge --base HEAD:linux/.config --new linux/.config \
      --srcdir linux --memo memos.csv --history history.csv \
      --history-note "REQ-1234: enable FIPS crypto support" -o kernel.xlsx
    ```
@@ -170,9 +168,11 @@ change history, and `memos.csv` explains the non-obvious choices.
     --memo memos.csv --history history.csv -o kernel.xlsx
   ```
 
-- **Review a change** three ways: `git diff linux/.config` (the value
-  changes), `history.csv` (labeled batches — filter by `batch` in Excel), or
-  `kcm diff --base <old> --new <new> --srcdir linux` (a titled report).
+- **Review a change** four ways: `git diff linux/.config` (the value
+  changes), `history.csv` (labeled batches — filter by `batch` in Excel),
+  `kcm diff --base <old> --new <new> --srcdir linux` (a titled report), or
+  `kcm diff --base HEAD:linux/.config --new linux/.config --patch` (a
+  git-applicable patch for review / PRs).
 - **Compare against a frozen baseline** any time:
 
   ```sh
@@ -195,9 +195,9 @@ change history, and `memos.csv` explains the non-obvious choices.
 
 ## The base is just a text config
 
-`diff-merge --base` takes any text `.config`, so the base can be whatever `git`
-hands you: `git show HEAD:linux/.config` (or `<ref>:linux/.config`) written to
-a temp file, or a copy you saved before the change. This is what makes the
-delta git-native — you are diffing two committed configs, not the possibly
-stale workbook. (Accepting git refs directly, and stamping the commit hash into
-the history, are planned for a later release.)
+`diff-merge --base` takes any text `.config` — a file path or a git rev
+(`HEAD:linux/.config`, `<ref>:linux/.config`), or a copy you saved before the
+change. Pass the git rev directly (no temp file), which is what makes the
+delta git-native: you diff two committed configs, not the possibly stale
+workbook, and the batch records the base commit in `base_commit` for the
+audit trail. Run `kcm` from inside the repo so `git show` finds it.
