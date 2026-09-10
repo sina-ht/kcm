@@ -4,7 +4,10 @@
 Kconfig tree) for viewing or editing in spreadsheet apps such as Excel,
 reports the differences between two `.config` files, and manages per-config
 memos (annotations) and a change history in separate CSVs that persist
-across dumps.
+across dumps. `commit` records the committed-to-working change and git-commits
+it in one step, and `history` pretty-prints the audit trail (with per-batch
+patches). A `.kcmrc` project file supplies the paths so the common commands
+need no flags.
 
 ## License
 
@@ -55,9 +58,39 @@ accept a **file path** or a **git rev**:
   `HEAD`/`main`/`@{upstream}` which borrows the path from the other operand
   (so `--base HEAD --new linux/.config` reads `HEAD:linux/.config`).
 
-Git runs in the current working directory, so run `kcm` from inside the repo.
-This is what makes the git-native workflow work without temp files — diff and
-record straight against `HEAD`.
+Git runs from the **project root** (the directory of the discovered `.kcmrc`,
+or the current directory when there is none), so relative paths and `git show`
+resolve from there — run `kcm` from anywhere in the repo. This is what makes
+the git-native workflow work without temp files: diff and record straight
+against `HEAD`.
+
+## Project file (`.kcmrc`)
+
+A `.kcmrc` records the project's paths and defaults once, so the common
+commands need no flags (like `.git/config`). It is an INI file with a `[kcm]`
+section, discovered by **walking up** from the current directory; its
+directory becomes the project root. Precedence is **CLI flag > `.kcmrc` >
+built-in default**. Commit it to the repo (it is project config).
+
+```ini
+[kcm]
+config  = linux/.config      # the working .config (also the default --new)
+srcdir  = linux              # kernel source tree (contains Kconfig)
+xlsx    = kernel.xlsx        # the workbook (dump/diff-merge/commit output)
+memo    = memos.csv          # memo CSV (name,note)
+history = history.csv        # history CSV (the audit trail)
+# base    = HEAD:linux/.config   # default; equals HEAD:<config>
+# arch    = x86_64               # optional: arch / cc / ld
+```
+
+Keys: `config`, `srcdir`, `base`, `xlsx`, `sheet`, `memo`, `history`, and
+optionally `arch`/`cc`/`ld`. Two defaults are computed for you: `--new`
+defaults to `config`, and `--base` defaults to `HEAD:<config>` — so with a
+`.kcmrc` in place, `kcm diff`, `kcm diff-merge`, and `kcm commit` all mean
+"the change from the committed config to the working one".
+
+Control discovery with `--rc PATH` (use a specific file) or `--no-rc`
+(disable it).
 
 ## Commands
 
@@ -212,6 +245,62 @@ Extract the `History` sheet of a workbook back into a history CSV
 python3 kcm.py history-split --csv book.xlsx -o history.csv
 ```
 
+### commit
+
+One idempotent step that does the record-and-commit loop: diff the working
+config against the base (default `HEAD:<config>`), rebuild the workbook view,
+refresh the memo CSV, append a history batch, then `git add`/`git commit` the
+text sources. With a `.kcmrc` in place it takes only a note:
+
+```sh
+# with .kcmrc (config/srcdir/memo/history all come from it)
+python3 kcm.py commit --note "trim attack surface"
+# fully explicit
+python3 kcm.py commit --config linux/.config --base HEAD:linux/.config \
+  --srcdir linux --memo memos.csv --history history.csv -o kernel.xlsx \
+  --note "REQ-1234: enable FIPS crypto support"
+```
+
+Behavior:
+
+- **No changes** (config matches the base) → prints a notice and exits `0`
+  without touching anything (safe to re-run).
+- Commits the **text sources of truth** — the `.config`, `history.csv`, and
+  (if any memos) `memos.csv`. The commit message is the `--note` (or
+  `Update <config>`) plus greppable trailers:
+  ```
+  kcm-batch: 3f9a2c1d8b4e
+  kcm-base:  26d4c7f…
+  kcm-delta: 13 changed, 5 added, 1 removed
+  ```
+- The workbook is **written locally** (as the current view) when a path is set
+  (`-o`/`.kcmrc` `xlsx`) but is **not** committed by default — it is a derived
+  binary. Add `--commit-xlsx` to stage and commit it too.
+- `--no-git` writes the memos/history/workbook but skips `git`; `--no-memo`
+  skips the memo refresh; `--dry-run` reports the change and files without
+  writing or committing; `--signoff`/`-s` adds `Signed-off-by`.
+
+### history
+
+Pretty-print the change history from `history.csv`. `history` alone lists
+batches (like `git log`); `show` expands one.
+
+```sh
+python3 kcm.py history log                 # one line per batch, newest first
+python3 kcm.py history log --limit 5 --long
+python3 kcm.py history show 3f9a2c         # one batch: per-symbol old -> new
+python3 kcm.py history show 3f9a2c --patch # + the git unified diff for the batch
+python3 kcm.py history log --json
+```
+
+`log` prints `<batch>  <date>  base=<sha7>  new=<sha7>  <n>c <a>a <r>r  <note>`;
+`--reverse` for oldest-first, `--long` for a block per batch, `--json` for clean
+machine-readable output. `show <batch>` takes a full or unique-prefix batch id
+and lists each changed symbol with its `diff` cell (this needs no git). `--patch`
+rebuilds the batch as a git unified diff on stdout (base = `<base_commit>:<config>`,
+new = `<new_commit>:<config>` or `HEAD:<config>`; override with `--base`/`--new`),
+moving the human report to stderr so the patch stays clean.
+
 ## Typical workflow
 
 For an end-to-end guide to building and maintaining a kernel config as a
@@ -268,6 +357,10 @@ python3 kcm.py diff --base HEAD:linux/.config --new linux/.config --patch > chan
 python3 kcm.py diff-split --csv book.xlsx -o diff.csv
 ```
 
+Steps 2 and the `git commit` collapse into one idempotent command —
+`kcm commit --note "..."` (see [commit](#commit)); with a `.kcmrc` in place it
+is just `kcm commit --note "..."` and it also refreshes the memo CSV.
+
 ## Excel workbooks (.xlsx)
 
 All table files (`.csv`) can also be `.xlsx` workbooks, detected by
@@ -322,9 +415,11 @@ history CSV (`--history`):
 | `diff`        | same format as the diff column: `old -> new`, `+v`, `-v`       |
 | `note`        | from `--history-note`, or empty                                |
 
-The commit columns link each batch back to `git`: with `base_commit` recorded
-you can reconstruct the change as a patch, e.g.
-`diff --base <base_commit>:linux/.config --new <next>:linux/.config --patch`.
+The commit columns link each batch back to `git`: `history show <batch> --patch`
+reconstructs the batch as a git patch (or do it by hand with
+`diff --base <base_commit>:linux/.config --new <next>:linux/.config --patch`).
+Read the trail without Excel with `history log` (list) and `history show
+<batch>` (one batch's per-symbol changes) — see [history](#history).
 
 The history is the persistent record of config changes: data sheets are
 replaced on re-dump, the history is not. The `History` sheet is created on
