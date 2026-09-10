@@ -44,6 +44,21 @@ reported on stderr.
 
 The same columns are used for `.xlsx` output (see [Excel workbooks](#excel-workbooks-xlsx)).
 
+## Config inputs: file paths or git revs
+
+`dump --config`, and the `--base`/`--new` of `diff` and `diff-merge`, each
+accept a **file path** or a **git rev**:
+
+- a path that exists on disk is used as-is;
+- otherwise the argument is a git rev, read via `git show`:
+  `HEAD:linux/.config`, `main:linux/.config`, `v6.5:linux/.config`, or a bare
+  `HEAD`/`main`/`@{upstream}` which borrows the path from the other operand
+  (so `--base HEAD --new linux/.config` reads `HEAD:linux/.config`).
+
+Git runs in the current working directory, so run `kcm` from inside the repo.
+This is what makes the git-native workflow work without temp files — diff and
+record straight against `HEAD`.
+
 ## Commands
 
 ### dump
@@ -60,7 +75,7 @@ python3 kcm.py dump --config .config --srcdir linux --memo memo.csv \
 
 | option     | default      | description                                          |
 |------------|--------------|------------------------------------------------------|
-| `--config` | (required)   | path to the `.config` file                           |
+| `--config` | (required)   | path to the `.config` file, or a git rev (see [Config inputs](#config-inputs-file-paths-or-git-revs)) |
 | `--srcdir` | (required)   | path to the kernel source tree (contains `Kconfig`)  |
 | `--memo`   | none         | memo CSV to pre-fill the `memo` column               |
 | `--history`| none         | history CSV to build the `History` sheet from (`.xlsx` only) |
@@ -82,13 +97,12 @@ Report the differences between two `.config` files as a human-readable list
 on stdout (summary counts go to stderr). `--srcdir` appends the Kconfig title
 of each changed symbol.
 
-`--base`/`--new` also accept dump tables (`.csv` or `.xlsx`) instead of
-`.config` files, detected by extension — e.g. to compare two sheets of the
-same workbook:
+`--base`/`--new` accept file paths, git revs (see [Config inputs](#config-inputs-file-paths-or-git-revs)), or dump tables (`.csv` or `.xlsx`, detected by extension) — e.g. to compare two sheets of the same workbook:
 
 ```sh
 python3 kcm.py diff --base .config --new .config.new
 python3 kcm.py diff --base .config --new .config.new --srcdir linux
+python3 kcm.py diff --base HEAD:linux/.config --new linux/.config --srcdir linux
 python3 kcm.py diff --base book.xlsx --base-sheet before \
                     --new book.xlsx --new-sheet after
 ```
@@ -101,6 +115,19 @@ added (1):
   CONFIG_RUSTC_HAS_SPAN_FILE: +y
 removed (1):
   CONFIG_DECOMPRESS_ZSTD: -y
+```
+
+### diff --patch
+
+With `--patch` (or `-u`), `diff` emits a git-style **unified diff** of the two
+configs on stdout instead of the report (both operands must be `.config`
+inputs, not tables). The counts still go to stderr, and the exit status is
+`1` when the configs differ, `0` when they are identical — so it is usable in
+scripts. The output is `git apply`-compatible (`a/`/`b/` path prefixes):
+
+```sh
+python3 kcm.py diff --base HEAD:linux/.config --new linux/.config --patch > change.patch
+git apply --check change.patch
 ```
 
 ### diff-merge
@@ -124,6 +151,9 @@ history only.
 # git-native: record the change and append a history batch
 python3 kcm.py diff-merge --base .config --new .config.new --srcdir linux \
   -o book.xlsx --history history.csv --history-note "trim attack surface"
+# git-native straight against HEAD (no temp file); the batch records the base commit
+python3 kcm.py diff-merge --base HEAD:linux/.config --new linux/.config --srcdir linux \
+  -o book.xlsx --history history.csv --history-note "trim attack surface"
 # apply a memo CSV to the output
 python3 kcm.py diff-merge --base .config --new .config.new --memo memo.csv \
   -o dump.csv
@@ -138,8 +168,11 @@ config), `-v` (removed from it), empty (unchanged).
 Each run with changes is recorded as a **history batch** (see
 [History sheet](#history-sheet)): appended to the `History` sheet for
 `.xlsx` output and/or to the `--history` CSV. `--no-history` records
-nothing; `--history-note TEXT` stamps a note on every entry. A memo entry
-with no matching config option is ignored with a warning on stderr.
+nothing; `--history-note TEXT` stamps a note on every entry. When `--base`
+and/or `--new` is a git rev, the batch also records the corresponding commit
+hash(es) in `base_commit`/`new_commit` (empty when the input is an
+uncommitted worktree or a plain path). A memo entry with no matching config
+option is ignored with a warning on stderr.
 
 ### diff-split
 
@@ -172,8 +205,8 @@ python3 kcm.py memo-split --csv dump-annotated.csv -o memo.csv
 ### history-split
 
 Extract the `History` sheet of a workbook back into a history CSV
-(`batch,date,sheet,name,diff,note`). The inverse of `dump --history`, and
-how a change history is persisted out of a workbook.
+(`batch,date,base_commit,new_commit,sheet,name,diff,note`). The inverse of
+`dump --history`, and how a change history is persisted out of a workbook.
 
 ```sh
 python3 kcm.py history-split --csv book.xlsx -o history.csv
@@ -215,19 +248,23 @@ Duplicate names in a memo CSV: the last entry wins (a warning is printed).
 
 ## Diffing configs
 
-After re-generating a `.config` (e.g. via `make menuconfig`), review and
-record what changed:
+After re-generating a `.config` in the tree (e.g. via `make menuconfig`), the
+committed version at `HEAD` is the base and the working-tree file is the new
+state. Review and record what changed, straight against git (no temp files):
 
 ```sh
 # 1. Review the delta (optionally with Kconfig titles)
-python3 kcm.py diff --base .config --new .config.new --srcdir linux
+python3 kcm.py diff --base HEAD:linux/.config --new linux/.config --srcdir linux
 
 # 2. Record the delta: rebuild the table, fill the diff column,
-#    and append a history batch
-python3 kcm.py diff-merge --base .config --new .config.new --srcdir linux \
-  -o book.xlsx --history history.csv --history-note "..."
+#    and append a history batch (base_commit is stamped automatically)
+python3 kcm.py diff-merge --base HEAD:linux/.config --new linux/.config \
+  --srcdir linux -o book.xlsx --history history.csv --history-note "..."
 
-# 3. Persist just the current delta as a standalone file
+# 3. Emit the change as a git-applicable patch (for review / PRs)
+python3 kcm.py diff --base HEAD:linux/.config --new linux/.config --patch > change.patch
+
+# 4. Persist just the current delta as a standalone file
 python3 kcm.py diff-split --csv book.xlsx -o diff.csv
 ```
 
@@ -269,18 +306,25 @@ preserves data and basic formatting of the other sheets, but exotic content
 ## History sheet
 
 `diff-merge` records each run's changes as a **batch**: one row per changed
-symbol, all sharing a `batch` id, a timestamp, and the `--history-note`.
-The batch is appended to the workbook's `History` sheet (for `.xlsx`
-output) and/or to a history CSV (`--history`):
+symbol, all sharing a `batch` id, a timestamp, the `--history-note`, and —
+when the inputs are git revs — the base/new commit hashes. The batch is
+appended to the workbook's `History` sheet (for `.xlsx` output) and/or to a
+history CSV (`--history`):
 
-| column  | meaning                                                        |
-|---------|----------------------------------------------------------------|
-| `batch` | per-run id (12-hex-char token); every row of a run shares it   |
-| `date`  | when the `diff-merge` ran (Excel datetime in the sheet; local time) |
-| `sheet` | the table sheet that was updated                               |
-| `name`  | the `CONFIG_` symbol                                           |
-| `diff`  | same format as the diff column: `old -> new`, `+v`, `-v`       |
-| `note`  | from `--history-note`, or empty                                |
+| column        | meaning                                                        |
+|---------------|----------------------------------------------------------------|
+| `batch`       | per-run id (12-hex-char token); every row of a run shares it   |
+| `date`        | when the `diff-merge` ran (Excel datetime in the sheet; local time) |
+| `base_commit` | git commit the `--base` came from (full SHA; empty if not a git rev) |
+| `new_commit`  | git commit the `--new` came from (full SHA; empty for an uncommitted worktree or a non-rev input) |
+| `sheet`       | the table sheet that was updated                               |
+| `name`        | the `CONFIG_` symbol                                           |
+| `diff`        | same format as the diff column: `old -> new`, `+v`, `-v`       |
+| `note`        | from `--history-note`, or empty                                |
+
+The commit columns link each batch back to `git`: with `base_commit` recorded
+you can reconstruct the change as a patch, e.g.
+`diff --base <base_commit>:linux/.config --new <next>:linux/.config --patch`.
 
 The history is the persistent record of config changes: data sheets are
 replaced on re-dump, the history is not. The `History` sheet is created on
