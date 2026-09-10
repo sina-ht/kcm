@@ -3,7 +3,14 @@
 `kcm.py` dumps a kernel `.config` to CSV (with metadata parsed from the
 Kconfig tree) for viewing or editing in spreadsheet apps such as Excel,
 reports the differences between two `.config` files, and manages per-config
-memos (annotations) in a separate CSV that persists across dumps.
+memos (annotations) and a change history in separate CSVs that persist
+across dumps.
+
+## License
+
+- (C)Copyright 2026 by Hiroshi Takekawa
+- SPDX-License-Identifier: GPL-2.0-only
+- Note that the license is GPLv2 only, no later option.
 
 ## Requirements
 
@@ -46,7 +53,9 @@ Parse a `.config` and a kernel source tree, write the CSV (or `.xlsx`).
 ```sh
 python3 kcm.py dump --config .config --srcdir linux -o dump.csv
 python3 kcm.py dump --config .config --srcdir linux --memo memo.csv -o dump.csv
-python3 kcm.py dump --config .config --srcdir linux -o book.xlsx --sheet v7.1
+# build the full workbook view from the text sources (memos + history)
+python3 kcm.py dump --config .config --srcdir linux --memo memo.csv \
+  --history history.csv -o book.xlsx
 ```
 
 | option     | default      | description                                          |
@@ -54,6 +63,7 @@ python3 kcm.py dump --config .config --srcdir linux -o book.xlsx --sheet v7.1
 | `--config` | (required)   | path to the `.config` file                           |
 | `--srcdir` | (required)   | path to the kernel source tree (contains `Kconfig`)  |
 | `--memo`   | none         | memo CSV to pre-fill the `memo` column               |
+| `--history`| none         | history CSV to build the `History` sheet from (`.xlsx` only) |
 | `--sheet`  | `config`     | sheet in the output workbook (`.xlsx` only)          |
 | `-o`       | stdout       | output CSV file (or `.xlsx` workbook)                |
 | `--arch`   | `x86_64`     | target architecture (also sets `SRCARCH` correctly)  |
@@ -62,7 +72,9 @@ python3 kcm.py dump --config .config --srcdir linux -o book.xlsx --sheet v7.1
 
 `--arch`/`--cc`/`--ld` only affect parsing of the Kconfig tree (e.g.
 arch-specific `source` paths and `cc-option` probes); they do not change the
-values, which always come from the `.config`.
+values, which always come from the `.config`. `--history` replaces the
+`History` sheet with the given CSV (it is a build, not an append); a memo
+entry with no matching config option is ignored with a warning on stderr.
 
 ### diff
 
@@ -93,27 +105,41 @@ removed (1):
 
 ### diff-merge
 
-Fill the `diff` column of an existing dump CSV by comparing each row's
-`value` against a (changed) `.config`. Symbols present only in the new
-`.config` get an appended row, with metadata from the Kconfig tree when
-`--srcdir` is given. Re-running with the same config as before clears
-stale diff cells.
+Update a dump table against a (changed) config and record the change. The
+delta is computed between a base and the new config:
+
+- **git-native (recommended):** give both as text configs with `--base` and
+  `--new`. The output table is rebuilt to reflect the new (current) config,
+  so it is always a clean view of "what is in the kernel now".
+- **table base:** give `--csv <table>` (with no `--base`); the table's
+  `value` column is the base and its `memo` column is carried forward
+  (unless overridden by `--memo`).
+
+The output table has one row per symbol in the new config, with the `diff`
+column showing this run's change and (when `--srcdir` is given) Kconfig
+metadata. Removed symbols are not kept as rows — they are recorded in the
+history only.
 
 ```sh
-python3 kcm.py diff-merge --csv dump.csv --new .config.new --srcdir linux -o dump-diff.csv
-python3 kcm.py diff-merge --csv book.xlsx --sheet before --new .config.new \
+# git-native: record the change and append a history batch
+python3 kcm.py diff-merge --base .config --new .config.new --srcdir linux \
+  -o book.xlsx --history history.csv --history-note "trim attack surface"
+# apply a memo CSV to the output
+python3 kcm.py diff-merge --base .config --new .config.new --memo memo.csv \
+  -o dump.csv
+# table base (in place): base and memos come from the existing table
+python3 kcm.py diff-merge --csv book.xlsx --new .config.new \
   -o book.xlsx --out-sheet before
-python3 kcm.py diff-merge --csv book.xlsx --new .config.new -o book.xlsx \
-  --history-note "switch initramfs compression to LZ4"
 ```
 
 Diff cell format: `old -> new` (value changed), `+v` (added in the new
 config), `-v` (removed from it), empty (unchanged).
 
-When the output is a `.xlsx` workbook, the delta is also appended to the
-workbook's `History` sheet (see [History sheet](#history-sheet)):
-`--no-history` suppresses this, and `--history-note TEXT` stamps a note on
-every entry of the run.
+Each run with changes is recorded as a **history batch** (see
+[History sheet](#history-sheet)): appended to the `History` sheet for
+`.xlsx` output and/or to the `--history` CSV. `--no-history` records
+nothing; `--history-note TEXT` stamps a note on every entry. A memo entry
+with no matching config option is ignored with a warning on stderr.
 
 ### diff-split
 
@@ -141,6 +167,16 @@ memo CSV (`name,note` header). This is how memos are persisted between dumps.
 
 ```sh
 python3 kcm.py memo-split --csv dump-annotated.csv -o memo.csv
+```
+
+### history-split
+
+Extract the `History` sheet of a workbook back into a history CSV
+(`batch,date,sheet,name,diff,note`). The inverse of `dump --history`, and
+how a change history is persisted out of a workbook.
+
+```sh
+python3 kcm.py history-split --csv book.xlsx -o history.csv
 ```
 
 ## Typical workflow
@@ -186,11 +222,13 @@ record what changed:
 # 1. Review the delta (optionally with Kconfig titles)
 python3 kcm.py diff --base .config --new .config.new --srcdir linux
 
-# 2. Record the delta in the spreadsheet's diff column
-python3 kcm.py diff-merge --csv dump.csv --new .config.new --srcdir linux -o dump-diff.csv
+# 2. Record the delta: rebuild the table, fill the diff column,
+#    and append a history batch
+python3 kcm.py diff-merge --base .config --new .config.new --srcdir linux \
+  -o book.xlsx --history history.csv --history-note "..."
 
-# 3. Persist the delta as a standalone file
-python3 kcm.py diff-split --csv dump-diff.csv -o diff.csv
+# 3. Persist just the current delta as a standalone file
+python3 kcm.py diff-split --csv book.xlsx -o diff.csv
 ```
 
 ## Excel workbooks (.xlsx)
@@ -230,23 +268,31 @@ preserves data and basic formatting of the other sheets, but exotic content
 
 ## History sheet
 
-`diff-merge` writing to a `.xlsx` workbook appends one row per changed
-symbol to the workbook's `History` sheet:
+`diff-merge` records each run's changes as a **batch**: one row per changed
+symbol, all sharing a `batch` id, a timestamp, and the `--history-note`.
+The batch is appended to the workbook's `History` sheet (for `.xlsx`
+output) and/or to a history CSV (`--history`):
 
 | column  | meaning                                                        |
 |---------|----------------------------------------------------------------|
-| `date`  | when the `diff-merge` ran (real Excel datetime, local time)    |
+| `batch` | per-run id (12-hex-char token); every row of a run shares it   |
+| `date`  | when the `diff-merge` ran (Excel datetime in the sheet; local time) |
 | `sheet` | the table sheet that was updated                               |
 | `name`  | the `CONFIG_` symbol                                           |
 | `diff`  | same format as the diff column: `old -> new`, `+v`, `-v`       |
-| `note`  | from `--history-note`, or empty for manual annotation          |
+| `note`  | from `--history-note`, or empty                                |
 
-The sheet is created on first use and only ever grows (one batch per run,
-tagged by date), so it is the persistent record of config changes — data
-sheets are replaced on re-dump, the history is not. A run with no changes
-appends nothing; `--no-history` skips the record entirely. Don't name a
-data sheet `History`: `diff-merge` refuses to record history when the
-output sheet has that name.
+The history is the persistent record of config changes: data sheets are
+replaced on re-dump, the history is not. The `History` sheet is created on
+first use and only ever grows (one batch appended per run); a run with no
+changes appends nothing, and `--no-history` skips the record entirely.
+
+The history **CSV is the text source of truth** for the history (see
+[WORKFLOW.md](WORKFLOW.md)). `dump --history FILE` rebuilds the `History`
+sheet from it, and `history-split` extracts it back out, so the workbook's
+history is a regenerable view of the CSV. Don't name a data sheet
+`History`: `diff-merge`/`dump` refuse to record or build history when a
+data sheet has that name.
 
 ## Notes
 
