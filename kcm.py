@@ -14,16 +14,20 @@ persistent CSV.
 Diff cells (filled by 'diff-merge'): 'old -> new' (value changed), '+v'
 (symbol added in the new config), '-v' (symbol removed from it).
 
-'diff-merge' writing to .xlsx also appends one row per changed symbol to
-the workbook's History sheet (date, sheet, name, diff, note).
+Change history: 'diff-merge' records one row per changed symbol as a batch
+(batch, date, sheet, name, diff, note), stamped with a per-run batch id.
+The batch is appended to the workbook's History sheet (.xlsx output) and/or
+a history CSV (--history); 'dump --history' rebuilds the History sheet from
+a history CSV, and 'history-split' extracts it back out.
 
 Commands:
-  dump        .config + Kconfig tree -> CSV
-  diff        two .config files -> human-readable change report
-  diff-merge  dump CSV + new .config -> CSV with the diff column filled
-  diff-split  dump CSV -> diff.csv (name,diff)
-  memo-merge  CSV + memo.csv -> CSV with the memo column filled
-  memo-split  annotated CSV -> memo.csv (name,note)
+  dump         .config + Kconfig tree -> CSV/.xlsx (optionally with memos + history)
+  diff         two configs -> human-readable change report
+  diff-merge   base + new config -> table with diff column + a history batch
+  diff-split   dump table -> diff.csv (name,diff)
+  memo-merge   table + memo.csv -> table with the memo column filled
+  memo-split   annotated table -> memo.csv (name,note)
+  history-split History sheet -> history.csv
 """
 
 import argparse
@@ -32,13 +36,15 @@ import io
 import os
 import re
 import sys
+import uuid
 from datetime import datetime
 
 COLUMNS = ["name", "type", "title", "value", "diff", "default", "depends", "memo"]
 CONFIG_PREFIX = "CONFIG_"
 DEFAULT_SHEET = "config"
 HISTORY_SHEET = "History"
-HISTORY_COLUMNS = ["date", "sheet", "name", "diff", "note"]
+HISTORY_COLUMNS = ["batch", "date", "sheet", "name", "diff", "note"]
+HISTORY_DATE_FMT = "%Y-%m-%d %H:%M"
 
 # Kernel 7.x Kconfig keywords/constructs not (yet) known to kconfiglib.
 # Bare property lines that can be dropped without changing semantics.
@@ -243,6 +249,73 @@ def load_memo(path):
     return memos
 
 
+def _warn_orphan_memos(memos, config_names):
+    """Warn about memo entries whose option is absent from the config."""
+    orphans = sorted(n for n in memos if n and n not in config_names)
+    if orphans:
+        print(
+            "warning: {} memo(s) have no matching config option (ignored): {}".format(
+                len(orphans), ", ".join(CONFIG_PREFIX + n for n in orphans)
+            ),
+            file=sys.stderr,
+        )
+
+
+def load_history(path):
+    """Read a history CSV -> list of [batch, datetime, sheet, name, diff, note]."""
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        rows = [row for row in reader if any(cell.strip() for cell in row)]
+    if not rows:
+        return []
+    header = [c.strip().lower() for c in rows[0]]
+    if "batch" not in header:
+        raise SystemExit(
+            "error: {} is not a history CSV (no 'batch' column)".format(path)
+        )
+    idx = {c: header.index(c) for c in HISTORY_COLUMNS if c in header}
+
+    def cell(row, col):
+        i = idx.get(col)
+        return row[i].strip() if i is not None and i < len(row) else ""
+
+    out = []
+    for row in rows[1:]:
+        date_s = cell(row, "date")
+        try:
+            dt = datetime.strptime(date_s, HISTORY_DATE_FMT)
+        except ValueError:
+            raise SystemExit(
+                "error: bad date {!r} in {} (expected {})".format(
+                    date_s, path, HISTORY_DATE_FMT
+                )
+            )
+        out.append(
+            [
+                cell(row, "batch"),
+                dt,
+                cell(row, "sheet"),
+                cell(row, "name"),
+                cell(row, "diff"),
+                cell(row, "note"),
+            ]
+        )
+    return out
+
+
+def append_history_csv(path, rows):
+    """Append history rows to a CSV, adding a header if the file is new."""
+    exists = os.path.exists(path) and os.path.getsize(path) > 0
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not exists:
+            writer.writerow(HISTORY_COLUMNS)
+        for batch, dt, sheet, name, diff, note in rows:
+            writer.writerow(
+                [batch, dt.strftime(HISTORY_DATE_FMT), sheet, name, diff, note]
+            )
+
+
 def _is_xlsx(path):
     return isinstance(path, str) and path.lower().endswith(".xlsx")
 
@@ -360,22 +433,35 @@ def _format_sheet(ws, columns, rows):
         ws.column_dimensions[get_column_letter(i)].width = min(max(width + 2, 8), 60)
 
 
-def _append_history(wb, entries):
-    """Append (date, sheet, name, diff, note) tuples to the History sheet."""
+def _write_history_sheet(wb, rows, append):
+    """Write history rows to the History sheet, appending or replacing it."""
+    if append:
+        if not rows:
+            return
+        if HISTORY_SHEET in wb.sheetnames:
+            ws = wb[HISTORY_SHEET]
+            for row in rows:
+                ws.append(row)
+            ws.auto_filter.ref = ws.dimensions
+        else:
+            ws = wb.create_sheet(title=HISTORY_SHEET)
+            ws.append(HISTORY_COLUMNS)
+            for row in rows:
+                ws.append(row)
+            _format_sheet(ws, HISTORY_COLUMNS, rows)
+        return
     if HISTORY_SHEET in wb.sheetnames:
-        ws = wb[HISTORY_SHEET]
-        for entry in entries:
-            ws.append(entry)
-        ws.auto_filter.ref = ws.dimensions
-    else:
-        ws = wb.create_sheet(title=HISTORY_SHEET)
-        ws.append(HISTORY_COLUMNS)
-        for entry in entries:
-            ws.append(entry)
-        _format_sheet(ws, HISTORY_COLUMNS, entries)
+        del wb[HISTORY_SHEET]
+    if not rows:
+        return
+    ws = wb.create_sheet(title=HISTORY_SHEET)
+    ws.append(HISTORY_COLUMNS)
+    for row in rows:
+        ws.append(row)
+    _format_sheet(ws, HISTORY_COLUMNS, rows)
 
 
-def _write_table_xlsx(path, rows, sheet, history=None):
+def _write_table_xlsx(path, rows, sheet, history=None, history_append=True):
     openpyxl = _import_openpyxl()
 
     if os.path.exists(path):
@@ -401,14 +487,14 @@ def _write_table_xlsx(path, rows, sheet, history=None):
     for row in rows:
         ws.append(row)
     _format_sheet(ws, COLUMNS, rows)
-    if history:
-        _append_history(wb, history)
+    if history is not None:
+        _write_history_sheet(wb, history, history_append)
     wb.save(path)
 
 
-def write_table(path, rows, sheet=None, history=None):
+def write_table(path, rows, sheet=None, history=None, history_append=True):
     if _is_xlsx(path):
-        _write_table_xlsx(path, rows, sheet or DEFAULT_SHEET, history)
+        _write_table_xlsx(path, rows, sheet or DEFAULT_SHEET, history, history_append)
         return
     out = sys.stdout if path is None or path == "-" else open(
         path, "w", newline="", encoding="utf-8"
@@ -445,6 +531,14 @@ def cmd_dump(args):
     values = parse_config(args.config)
     kconf, kconfiglib = load_kconfig(args.srcdir, args.arch, args.cc, args.ld)
     memos = load_memo(args.memo) if args.memo else {}
+    if memos:
+        _warn_orphan_memos(memos, {norm_name(n) for n in values})
+    is_xlsx = _is_xlsx(args.output)
+    if args.history and is_xlsx and (args.sheet or DEFAULT_SHEET) == HISTORY_SHEET:
+        raise SystemExit(
+            "error: cannot build the {} sheet: the data sheet name "
+            "{!r} collides with it".format(HISTORY_SHEET, args.sheet or DEFAULT_SHEET)
+        )
     rows = []
     unknown = 0
     for name, raw in values.items():
@@ -463,7 +557,8 @@ def cmd_dump(args):
                 memos.get(norm_name(name), ""),
             ]
         )
-    write_table(args.output, rows, args.sheet)
+    history = load_history(args.history) if (args.history and is_xlsx) else None
+    write_table(args.output, rows, args.sheet, history, history_append=False)
     print(
         "wrote {} rows to {} ({} not found in Kconfig)".format(
             len(rows), args.output or "stdout", unknown
@@ -542,66 +637,116 @@ def cmd_diff(args):
 
 
 def cmd_diff_merge(args):
-    new = {norm_name(k): v for k, v in parse_config(args.new).items()}
-    header, rows = read_table(args.csv, args.sheet)
-    name_i = header.index("name")
-    value_i = header.index("value")
-    diff_i = header.index("diff")
-    counts = {"changed": 0, "added": 0, "removed": 0}
-    known = set()
-    for row in rows:
-        name = norm_name(row[name_i])
-        known.add(name)
-        old_raw = row[value_i]
-        if name not in new:
-            row[diff_i] = diff_cell("removed", old_raw, "")
-            counts["removed"] += 1
-        elif strip_quotes(new[name]) != strip_quotes(old_raw):
-            row[diff_i] = diff_cell("changed", old_raw, new[name])
-            counts["changed"] += 1
-        else:
-            row[diff_i] = ""
+    name_i = COLUMNS.index("name")
+    value_i = COLUMNS.index("value")
+    diff_i = COLUMNS.index("diff")
+    type_i = COLUMNS.index("type")
+    title_i = COLUMNS.index("title")
+    default_i = COLUMNS.index("default")
+    depends_i = COLUMNS.index("depends")
+    memo_i = COLUMNS.index("memo")
+
+    new = {norm_name(k): strip_quotes(v) for k, v in parse_config(args.new).items()}
+    if args.base:
+        base = {
+            norm_name(k): strip_quotes(v) for k, v in parse_config(args.base).items()
+        }
+        memos = load_memo(args.memo) if args.memo else {}
+    elif args.csv:
+        header, trows = read_table(args.csv, args.sheet)
+        t_name = header.index("name")
+        t_value = header.index("value")
+        t_memo = header.index("memo")
+        base = {
+            norm_name(r[t_name]): strip_quotes(r[t_value])
+            for r in trows
+            if r[t_name].strip()
+        }
+        memos = load_memo(args.memo) if args.memo else {
+            norm_name(r[t_name]): r[t_memo].strip()
+            for r in trows
+            if r[t_name].strip() and r[t_memo].strip()
+        }
+    else:
+        raise SystemExit("error: diff-merge needs --base <config> or --csv <table>")
+
+    if memos:
+        _warn_orphan_memos(memos, set(new))
+
     kconf, kconfiglib = (
         load_kconfig(args.srcdir, args.arch, args.cc, args.ld)
         if args.srcdir
         else (None, None)
     )
-    for name, raw in new.items():
-        if name in known:
-            continue
+
+    records = diff_values(base, new)
+    diff_lookup = {r[0]: r for r in records if r[3] in ("changed", "added")}
+
+    # The table is a view of the current (--new) config: one row per symbol in
+    # it, with the diff column showing this run's change. Removed symbols are
+    # recorded in the history, not kept as rows.
+    rows = []
+    for name, val in new.items():
         row = [""] * len(COLUMNS)
         row[name_i] = CONFIG_PREFIX + name
-        row[value_i] = strip_quotes(raw)
-        row[diff_i] = diff_cell("added", "", raw)
+        row[value_i] = val
+        rec = diff_lookup.get(name)
+        row[diff_i] = diff_cell(rec[3], rec[1], rec[2]) if rec else ""
         if kconf is not None:
             sym = kconf.syms.get(name)
             if sym is not None:
-                row[header.index("type")] = sym_type(kconfiglib, sym)
-                row[header.index("title")] = sym_title(sym)
-                row[header.index("default")] = sym_defaults(kconfiglib, sym)
-                row[header.index("depends")] = sym_depends(kconfiglib, sym)
+                row[type_i] = sym_type(kconfiglib, sym)
+                row[title_i] = sym_title(sym)
+                row[default_i] = sym_defaults(kconfiglib, sym)
+                row[depends_i] = sym_depends(kconfiglib, sym)
+        row[memo_i] = memos.get(name, "")
         rows.append(row)
-        counts["added"] += 1
-    history = None
-    if _is_xlsx(args.output) and not args.no_history:
-        out_sheet = args.out_sheet or DEFAULT_SHEET
-        if out_sheet == HISTORY_SHEET:
-            raise SystemExit(
-                "error: cannot record history: the output sheet name "
-                "{!r} collides with the {} sheet".format(out_sheet, HISTORY_SHEET)
-            )
+
+    counts = {"changed": 0, "added": 0, "removed": 0}
+    for rec in records:
+        counts[rec[3]] += 1
+
+    out_sheet = args.out_sheet or DEFAULT_SHEET
+    sheet_history = None
+    batch = None
+    if not args.no_history:
+        batch_id = uuid.uuid4().hex[:12]
         now = datetime.now().replace(second=0, microsecond=0)
-        history = [
-            (now, out_sheet, r[name_i], r[diff_i], args.history_note or "")
-            for r in rows
-            if r[diff_i]
-        ]
-    write_table(args.output, rows, args.out_sheet, history)
+        note = args.history_note or ""
+        batch = []
+        for rec in records:
+            cell = diff_cell(rec[3], rec[1], rec[2])
+            if cell:
+                batch.append(
+                    [batch_id, now, out_sheet, CONFIG_PREFIX + rec[0], cell, note]
+                )
+        if args.history and batch:
+            append_history_csv(args.history, batch)
+        if _is_xlsx(args.output) and batch:
+            if out_sheet == HISTORY_SHEET:
+                raise SystemExit(
+                    "error: cannot record history: the output sheet name "
+                    "{!r} collides with the {} sheet".format(
+                        out_sheet, HISTORY_SHEET
+                    )
+                )
+            sheet_history = batch
+
+    write_table(args.output, rows, args.out_sheet, sheet_history, history_append=True)
+
+    sinks = []
+    if batch and args.history:
+        sinks.append(args.history)
+    if sheet_history:
+        sinks.append(HISTORY_SHEET)
+    suffix = " ({} -> {})".format(len(batch), ", ".join(sinks)) if sinks else ""
     print(
         "{} changed, {} added, {} removed -> {}{}".format(
-            counts["changed"], counts["added"], counts["removed"],
+            counts["changed"],
+            counts["added"],
+            counts["removed"],
             args.output or "stdout",
-            " ({} -> {})".format(len(history), HISTORY_SHEET) if history else "",
+            suffix,
         ),
         file=sys.stderr,
     )
@@ -682,6 +827,58 @@ def cmd_memo_split(args):
     )
 
 
+def cmd_history_split(args):
+    if not _is_xlsx(args.csv):
+        raise SystemExit(
+            "error: history-split reads a .xlsx workbook (got {})".format(args.csv)
+        )
+    openpyxl = _import_openpyxl()
+    wb = openpyxl.load_workbook(args.csv, data_only=True, read_only=True)
+    try:
+        if HISTORY_SHEET not in wb.sheetnames:
+            raise SystemExit(
+                "error: no {} sheet in {}".format(HISTORY_SHEET, args.csv)
+            )
+        ws = wb[HISTORY_SHEET]
+        raw = []
+        for row in ws.iter_rows(values_only=True):
+            if any(v is not None and str(v).strip() for v in row):
+                raw.append(list(row))
+    finally:
+        wb.close()
+    if not raw:
+        raise SystemExit(
+            "error: empty {} sheet in {}".format(HISTORY_SHEET, args.csv)
+        )
+    header = [c.strip().lower() for c in raw[0]]
+    idx = {c: header.index(c) for c in HISTORY_COLUMNS if c in header}
+    out = sys.stdout if args.output is None or args.output == "-" else open(
+        args.output, "w", newline="", encoding="utf-8"
+    )
+    try:
+        writer = csv.writer(out)
+        writer.writerow(HISTORY_COLUMNS)
+        count = 0
+        for row in raw[1:]:
+            vals = []
+            for col in HISTORY_COLUMNS:
+                i = idx.get(col)
+                v = row[i] if i is not None and i < len(row) else None
+                if col == "date" and isinstance(v, datetime):
+                    vals.append(v.strftime(HISTORY_DATE_FMT))
+                else:
+                    vals.append(_cell_str(v).strip())
+            writer.writerow(vals)
+            count += 1
+    finally:
+        if out is not sys.stdout:
+            out.close()
+    print(
+        "split {} history rows -> {}".format(count, args.output or "stdout"),
+        file=sys.stderr,
+    )
+
+
 def _add_sheet_args(p, with_output=False):
     """Add sheet-name flags for .xlsx tables."""
     p.add_argument(
@@ -731,6 +928,10 @@ def main(argv=None):
     _add_kconfig_args(p, srcdir_required=True)
     p.add_argument("--memo", help="memo CSV to pre-fill the memo column")
     p.add_argument(
+        "--history",
+        help="history CSV to build the {} sheet from (.xlsx only)".format(HISTORY_SHEET),
+    )
+    p.add_argument(
         "--sheet",
         help="sheet in the output workbook (default: {}; .xlsx only)".format(
             DEFAULT_SHEET
@@ -765,22 +966,35 @@ def main(argv=None):
 
     p = sub.add_parser(
         "diff-merge",
-        help="fill the diff column of a dump table against a new .config",
+        help="update a dump table against a new config and record the change",
     )
-    p.add_argument("--csv", required=True, help="dump table (.csv or .xlsx, from 'dump')")
-    p.add_argument("--new", required=True, help="changed .config")
+    p.add_argument(
+        "--base",
+        help="original config (text .config); pairs with --new for the delta",
+    )
+    p.add_argument(
+        "--csv",
+        help="dump table to use as the base and memo source (or use --base <config>)",
+    )
+    p.add_argument("--new", required=True, help="changed config (text .config)")
+    p.add_argument(
+        "--memo",
+        help="memo CSV to apply to the output (overrides table memos)",
+    )
     _add_sheet_args(p, with_output=True)
     _add_kconfig_args(p)
     p.add_argument(
+        "--history",
+        help="history CSV to append this run's batch to (created if missing)",
+    )
+    p.add_argument(
         "--no-history",
         action="store_true",
-        help="do not append the changes to the {} sheet (.xlsx output)".format(
-            HISTORY_SHEET
-        ),
+        help="record no history (skip the {} sheet and --history)".format(HISTORY_SHEET),
     )
     p.add_argument(
         "--history-note",
-        help="note stamped on all {} entries of this run".format(HISTORY_SHEET),
+        help="note stamped on every {} entry of this run".format(HISTORY_SHEET),
     )
     p.add_argument("-o", "--output", help="output file (default: stdout)")
     p.set_defaults(func=cmd_diff_merge)
@@ -807,6 +1021,18 @@ def main(argv=None):
     _add_sheet_args(p)
     p.add_argument("-o", "--output", help="output memo CSV (default: stdout)")
     p.set_defaults(func=cmd_memo_split)
+
+    p = sub.add_parser(
+        "history-split",
+        help="extract the {} sheet of a workbook to a history CSV".format(HISTORY_SHEET),
+    )
+    p.add_argument(
+        "--csv",
+        required=True,
+        help="workbook (.xlsx) with a {} sheet".format(HISTORY_SHEET),
+    )
+    p.add_argument("-o", "--output", help="output history CSV (default: stdout)")
+    p.set_defaults(func=cmd_history_split)
 
     args = parser.parse_args(argv)
     args.func(args)
