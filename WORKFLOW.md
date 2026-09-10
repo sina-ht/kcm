@@ -11,7 +11,7 @@ and annotate the config.
 |----------------|---------------------------------------------|--------------------------------|
 | the config     | the tree's `.config` (post-`make olddefconfig`) | the actual values       |
 | annotations    | `memos.csv` (`name,note`)                   | the "why" for each option      |
-| change history | `history.csv` (`batch,date,sheet,name,diff,note`) | the audit trail      |
+| change history | `history.csv` (`batch,date,base_commit,new_commit,sheet,name,diff,note`) | the audit trail |
 
 The `.xlsx` is a **projection** of those three (plus the Kconfig tree for
 metadata). It holds no unique data: discard it and rebuild it any time with
@@ -22,6 +22,12 @@ commit-worthy state); the workbook is just what you are looking at.
 
 ## Conventions
 
+- **`.kcmrc` holds the paths**: one small INI file next to the tree
+  (`config`, `srcdir`, `memo`, `history`, `xlsx`) makes the commands below
+  flag-free — with it in place, `kcm commit --note "..."` is the entire
+  record-and-commit step. It is discovered by walking up from the current
+  directory, so run `kcm` from anywhere in the repo (see
+  [README](README.md#project-file-kcmrc)).
 - **One set of files per product/arch**: the tree's `.config`, `memos.csv`,
   `history.csv`, and a regenerable `kernel.xlsx`, all kept next to the tree.
 - **Working sheet** — `config` (the default sheet); **frozen baseline sheet
@@ -101,16 +107,20 @@ cd ..
 ```
 
 The config on disk is now the *new* state; the committed one at `HEAD` is the
-*base*. Record the change straight against git — rebuild the view, fill the
-`diff` column, and append a labeled batch to the history (both `history.csv`
-and the `History` sheet); the base commit is stamped automatically:
+*base*. Record **and** commit the change in one idempotent step. `commit`
+diffs the working config against `HEAD`, rebuilds the view, refreshes the
+memos (overlaying any annotations you made in `kernel.xlsx`), appends a
+labeled batch to the history, and git-commits the text sources — so the base
+commit is stamped and the config, history, and memos travel in one commit:
 
 ```sh
-python3 kcm.py diff-merge --base HEAD:linux/.config --new linux/.config \
-  --srcdir linux --memo memos.csv --history history.csv \
-  --history-note "attack-surface: disable unused filesystems, drivers, networking" \
-  -o kernel.xlsx
+python3 kcm.py commit --note "attack-surface: disable unused filesystems, drivers, networking"
 ```
+
+(with a `.kcmrc` in place this needs no other flags; otherwise pass
+`--config linux/.config --base HEAD:linux/.config --srcdir linux --memo
+memos.csv --history history.csv -o kernel.xlsx`). Re-running it is a no-op
+until the config moves again; `--dry-run` previews it.
 
 What just happened:
 
@@ -118,15 +128,23 @@ What just happened:
   shows this run's changes (`old -> new`, `+v`). Removed symbols are recorded
   in the history, not kept as rows.
 - A batch was appended to `history.csv` **and** the `History` sheet, every row
-  sharing one `batch` id, the run's timestamp, and the `--history-note`.
+  sharing one `batch` id, the run's timestamp, and the note; the batch's
+  `base_commit` is stamped from `HEAD`.
+- `linux/.config`, `history.csv`, and (if any) `memos.csv` were committed
+  together, with the batch id and base commit in the commit message. (The
+  workbook is written locally as your view but is not committed unless you
+  pass `--commit-xlsx`.)
 
-Commit the two files that changed — the config (values) and the history:
+To do it in two steps instead — record, then commit yourself:
 
 ```sh
+python3 kcm.py diff-merge --base HEAD:linux/.config --new linux/.config \
+  --srcdir linux --memo memos.csv --history history.csv \
+  --history-note "..." -o kernel.xlsx
 git add linux/.config history.csv && git commit -m "trim attack surface"
 ```
 
-`git diff` on `linux/.config` now shows exactly the value changes, and
+`git diff` on `linux/.config` shows exactly the value changes, and
 `history.csv` is the labeled audit trail.
 
 ## Stage 4 — A new requirement arrives
@@ -134,18 +152,16 @@ git add linux/.config history.csv && git commit -m "trim attack surface"
 Repeat the loop, and capture the requirement's rationale in the memos.
 
 1. Make the change in the tree: `make menuconfig && make olddefconfig`.
-2. Record it, naming the requirement in the history note:
+2. Annotate the symbols this requirement touches: edit their `memo` cells in
+   `kernel.xlsx` (e.g. `CONFIG_CRYPTO_FIPS` → `REQ-1234: required for FIPS
+   mode`).
+3. Record and commit it in one step, naming the requirement in the note.
+   `commit` picks the annotations up from the workbook, refreshes `memos.csv`,
+   appends the history batch, and commits the text sources:
 
    ```sh
-   python3 kcm.py diff-merge --base HEAD:linux/.config --new linux/.config \
-     --srcdir linux --memo memos.csv --history history.csv \
-     --history-note "REQ-1234: enable FIPS crypto support" -o kernel.xlsx
+   python3 kcm.py commit --note "REQ-1234: enable FIPS crypto support"
    ```
-
-3. Annotate the symbols this requirement touches: edit their `memo` cells in
-   Excel (e.g. `CONFIG_CRYPTO_FIPS` → `REQ-1234: required for FIPS mode`),
-   then `python3 kcm.py memo-split --csv kernel.xlsx -o memos.csv`.
-4. Commit: `git add linux/.config history.csv memos.csv && git commit -m "REQ-1234: FIPS"`.
 
 The config reflects the requirement, `history.csv` shows the whole labeled
 change history, and `memos.csv` explains the non-obvious choices.
@@ -157,8 +173,10 @@ change history, and `memos.csv` explains the non-obvious choices.
 - **The three text files are the state**: the `.config` (values), `memos.csv`
   (annotations), and `history.csv` (audit trail). Keep them complete and
   current in `git`; `kernel.xlsx` is disposable.
-- **Always `diff-merge` after a `menuconfig` session.** It is the sync step
-  that updates the view and appends the history batch.
+- **Always record the change after a `menuconfig` session** — `kcm commit
+  --note "..."` (one step: view + memos + history + git commit) or
+  `diff-merge` in two steps. It is the sync step that updates the view and
+  appends the history batch.
 - **The `diff` column is transient** (the last merge only); the `History`
   sheet / `history.csv` is the persistent record.
 - **Rebuild the view any time** from the committed sources:
@@ -168,11 +186,14 @@ change history, and `memos.csv` explains the non-obvious choices.
     --memo memos.csv --history history.csv -o kernel.xlsx
   ```
 
-- **Review a change** four ways: `git diff linux/.config` (the value
-  changes), `history.csv` (labeled batches — filter by `batch` in Excel),
-  `kcm diff --base <old> --new <new> --srcdir linux` (a titled report), or
-  `kcm diff --base HEAD:linux/.config --new linux/.config --patch` (a
-  git-applicable patch for review / PRs).
+- **Read the audit trail** without Excel: `kcm history log` (one line per
+  batch, newest first) and `kcm history show <batch>` (every symbol a batch
+  touched; add `--patch` for a git-applicable diff of just that batch).
+- **Review a change** several ways: `git diff linux/.config` (the value
+  changes), `kcm history log` / `kcm history show <batch>` (the labeled audit
+  trail), `kcm diff --base <old> --new <new> --srcdir linux` (a titled
+  report), or `kcm diff --base HEAD:linux/.config --new linux/.config
+  --patch` (a git-applicable patch for review / PRs).
 - **Compare against a frozen baseline** any time:
 
   ```sh
