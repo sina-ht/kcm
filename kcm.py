@@ -5,24 +5,29 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """kcm - Linux kernel configuration management tool.
 
-Dumps .config entries (name, type, title, value, diff, default, depends)
+ Dumps .config entries (name, type, title, value, diff, default, depends)
 to CSV or Excel (.xlsx, requires openpyxl) for viewing/editing in
 spreadsheet apps, reports the differences between two .config files (or
 dump tables), and manages per-config memos (annotations) in a separate
 persistent CSV.
 
+Config inputs (--config, --base, --new) may be a file path or a git rev
+(<ref>:<path>, or a bare <ref> that borrows the sibling operand's path).
+
 Diff cells (filled by 'diff-merge'): 'old -> new' (value changed), '+v'
 (symbol added in the new config), '-v' (symbol removed from it).
 
 Change history: 'diff-merge' records one row per changed symbol as a batch
-(batch, date, sheet, name, diff, note), stamped with a per-run batch id.
-The batch is appended to the workbook's History sheet (.xlsx output) and/or
-a history CSV (--history); 'dump --history' rebuilds the History sheet from
-a history CSV, and 'history-split' extracts it back out.
+(batch, date, base_commit, new_commit, sheet, name, diff, note), stamped
+with a per-run batch id and the git commit(s) the inputs span (empty when
+an input is an uncommitted worktree or plain path). The batch is appended
+to the workbook's History sheet (.xlsx output) and/or a history CSV
+(--history); 'dump --history' rebuilds the History sheet from a history
+CSV, and 'history-split' extracts it back out.
 
 Commands:
   dump         .config + Kconfig tree -> CSV/.xlsx (optionally with memos + history)
-  diff         two configs -> human-readable change report
+  diff         two configs -> change report, or a git unified diff (--patch)
   diff-merge   base + new config -> table with diff column + a history batch
   diff-split   dump table -> diff.csv (name,diff)
   memo-merge   table + memo.csv -> table with the memo column filled
@@ -35,6 +40,7 @@ import csv
 import io
 import os
 import re
+import subprocess
 import sys
 import uuid
 from datetime import datetime
@@ -43,7 +49,16 @@ COLUMNS = ["name", "type", "title", "value", "diff", "default", "depends", "memo
 CONFIG_PREFIX = "CONFIG_"
 DEFAULT_SHEET = "config"
 HISTORY_SHEET = "History"
-HISTORY_COLUMNS = ["batch", "date", "sheet", "name", "diff", "note"]
+HISTORY_COLUMNS = [
+    "batch",
+    "date",
+    "base_commit",
+    "new_commit",
+    "sheet",
+    "name",
+    "diff",
+    "note",
+]
 HISTORY_DATE_FMT = "%Y-%m-%d %H:%M"
 
 # Kernel 7.x Kconfig keywords/constructs not (yet) known to kconfiglib.
@@ -136,22 +151,107 @@ def load_kconfig(srcdir, arch, cc, ld):
     return kconfiglib.Kconfig("Kconfig", warn=False), kconfiglib
 
 
-def parse_config(path):
-    """Parse .config -> ordered dict CONFIG_NAME -> raw value string."""
+def parse_config_text(text):
+    """Parse .config text -> ordered dict CONFIG_NAME -> raw value string."""
     values = {}
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(CONFIG_PREFIX) and "=" in line:
-                key, _, val = line.partition("=")
-                values[key.strip()] = val.strip()
-            elif line.startswith("# " + CONFIG_PREFIX) and line.endswith(
-                " is not set"
-            ):
-                values[line[2 : -len(" is not set")].strip()] = "n"
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(CONFIG_PREFIX) and "=" in line:
+            key, _, val = line.partition("=")
+            values[key.strip()] = val.strip()
+        elif line.startswith("# " + CONFIG_PREFIX) and line.endswith(
+            " is not set"
+        ):
+            values[line[2 : -len(" is not set")].strip()] = "n"
     return values
+
+
+def parse_config(path):
+    with open(path, encoding="utf-8") as f:
+        return parse_config_text(f.read())
+
+
+def _git_show(spec):
+    """Return the content of a git revspec (<rev>:<path>)."""
+    try:
+        proc = subprocess.run(
+            ["git", "show", spec], capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        raise SystemExit(
+            "error: git is not installed (needed for git input {!r})".format(spec)
+        )
+    if proc.returncode != 0:
+        raise SystemExit(
+            "error: git show {} failed:\n{}".format(spec, proc.stderr.strip())
+        )
+    return proc.stdout
+
+
+def _git_commit(rev):
+    """Full SHA of the commit a rev points at, or '' if unresolvable."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", rev + "^{commit}"], capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        return ""
+    if proc.returncode != 0:
+        print(
+            "warning: could not resolve commit for git rev {!r}".format(rev),
+            file=sys.stderr,
+        )
+        return ""
+    return proc.stdout.strip()
+
+
+def resolve_config(arg, sibling_path=None):
+    """Resolve a config operand to a file path or a git revspec.
+
+    Returns a dict with file (path or None), text (str or None), label
+    (display/config path), and commit (full SHA for a git rev, else '').
+    An existing path is used as-is; anything else is treated as a git rev
+    (rev:path, or a bare rev that borrows sibling_path).
+    """
+    if os.path.exists(arg):
+        return {"file": arg, "text": None, "label": arg, "commit": ""}
+    if ":" in arg:
+        rev, path = arg.split(":", 1)
+    else:
+        if sibling_path is None:
+            raise SystemExit(
+                "error: git ref {!r} needs a path (use <ref>:<path>)".format(arg)
+            )
+        rev, path = arg, sibling_path
+    return {
+        "file": None,
+        "text": _git_show("{}:{}".format(rev, path)),
+        "label": path,
+        "commit": _git_commit(rev),
+    }
+
+
+def _raw_config_from(resolved):
+    if resolved["file"] is not None:
+        return parse_config(resolved["file"])
+    return parse_config_text(resolved["text"])
+
+
+def _source_text(resolved):
+    if resolved["file"] is not None:
+        with open(resolved["file"], encoding="utf-8") as f:
+            return f.read()
+    return resolved["text"]
+
+
+def _config_map_from(resolved, sheet=None):
+    if resolved["file"] is not None:
+        return load_config_map(resolved["file"], sheet)
+    return {
+        k: strip_quotes(v) for k, v in parse_config_text(resolved["text"]).items()
+    }
 
 
 def strip_quotes(val):
@@ -294,6 +394,8 @@ def load_history(path):
             [
                 cell(row, "batch"),
                 dt,
+                cell(row, "base_commit"),
+                cell(row, "new_commit"),
                 cell(row, "sheet"),
                 cell(row, "name"),
                 cell(row, "diff"),
@@ -306,13 +408,26 @@ def load_history(path):
 def append_history_csv(path, rows):
     """Append history rows to a CSV, adding a header if the file is new."""
     exists = os.path.exists(path) and os.path.getsize(path) > 0
+    if exists and [c.strip().lower() for c in _first_header(path, None)] != HISTORY_COLUMNS:
+        raise SystemExit(
+            "error: {} has an outdated history schema; regenerate it".format(path)
+        )
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not exists:
             writer.writerow(HISTORY_COLUMNS)
-        for batch, dt, sheet, name, diff, note in rows:
+        for batch, dt, base_commit, new_commit, sheet, name, diff, note in rows:
             writer.writerow(
-                [batch, dt.strftime(HISTORY_DATE_FMT), sheet, name, diff, note]
+                [
+                    batch,
+                    dt.strftime(HISTORY_DATE_FMT),
+                    base_commit,
+                    new_commit,
+                    sheet,
+                    name,
+                    diff,
+                    note,
+                ]
             )
 
 
@@ -528,7 +643,7 @@ def load_config_map(path, sheet=None):
 
 
 def cmd_dump(args):
-    values = parse_config(args.config)
+    values = _raw_config_from(resolve_config(args.config))
     kconf, kconfiglib = load_kconfig(args.srcdir, args.arch, args.cc, args.ld)
     memos = load_memo(args.memo) if args.memo else {}
     if memos:
@@ -598,9 +713,64 @@ def diff_cell(kind, old, new):
     return ""
 
 
+def unified_config_patch(old_text, new_text, base_label, new_label):
+    """Git-style unified diff of two config texts ('' when identical)."""
+    import difflib
+
+    return "".join(
+        difflib.unified_diff(
+            old_text.splitlines(True),
+            new_text.splitlines(True),
+            fromfile="a/" + base_label,
+            tofile="b/" + new_label,
+            n=3,
+        )
+    )
+
+
 def cmd_diff(args):
-    base = load_config_map(args.base, args.base_sheet)
-    new = load_config_map(args.new, args.new_sheet)
+    base_res = resolve_config(
+        args.base, sibling_path=(args.new if os.path.exists(args.new) else None)
+    )
+    new_res = resolve_config(
+        args.new, sibling_path=(args.base if os.path.exists(args.base) else None)
+    )
+    if args.patch:
+        for flag, res in (("--base", base_res), ("--new", new_res)):
+            p = res["file"]
+            if p is not None and (
+                p.lower().endswith(".csv") or p.lower().endswith(".xlsx")
+            ):
+                raise SystemExit(
+                    "error: --patch needs .config inputs (table given for {})".format(
+                        flag
+                    )
+                )
+        base_text = _source_text(base_res)
+        new_text = _source_text(new_res)
+        patch = unified_config_patch(
+            base_text, new_text, base_res["label"], new_res["label"]
+        )
+        if patch:
+            print(patch, end="", file=sys.stdout)
+        counts = {"changed": 0, "added": 0, "removed": 0}
+        for rec in diff_values(
+            {k: strip_quotes(v) for k, v in parse_config_text(base_text).items()},
+            {k: strip_quotes(v) for k, v in parse_config_text(new_text).items()},
+        ):
+            counts[rec[3]] += 1
+        print(
+            "{} changed, {} added, {} removed{}".format(
+                counts["changed"],
+                counts["added"],
+                counts["removed"],
+                "" if patch else " (no differences)",
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(1 if patch else 0)
+    base = _config_map_from(base_res, args.base_sheet)
+    new = _config_map_from(new_res, args.new_sheet)
     titles = {}
     if args.srcdir:
         kconf, _ = load_kconfig(args.srcdir, args.arch, args.cc, args.ld)
@@ -646,11 +816,26 @@ def cmd_diff_merge(args):
     depends_i = COLUMNS.index("depends")
     memo_i = COLUMNS.index("memo")
 
-    new = {norm_name(k): strip_quotes(v) for k, v in parse_config(args.new).items()}
+    new_res = resolve_config(
+        args.new,
+        sibling_path=(
+            args.base if args.base and os.path.exists(args.base) else None
+        ),
+    )
+    new = {
+        norm_name(k): strip_quotes(v) for k, v in _raw_config_from(new_res).items()
+    }
+    new_commit = new_res["commit"]
     if args.base:
+        base_res = resolve_config(
+            args.base,
+            sibling_path=(args.new if os.path.exists(args.new) else None),
+        )
         base = {
-            norm_name(k): strip_quotes(v) for k, v in parse_config(args.base).items()
+            norm_name(k): strip_quotes(v)
+            for k, v in _raw_config_from(base_res).items()
         }
+        base_commit = base_res["commit"]
         memos = load_memo(args.memo) if args.memo else {}
     elif args.csv:
         header, trows = read_table(args.csv, args.sheet)
@@ -662,12 +847,14 @@ def cmd_diff_merge(args):
             for r in trows
             if r[t_name].strip()
         }
+        base_commit = ""
         memos = load_memo(args.memo) if args.memo else {
             norm_name(r[t_name]): r[t_memo].strip()
             for r in trows
             if r[t_name].strip() and r[t_memo].strip()
         }
     else:
+        base_commit = ""
         raise SystemExit("error: diff-merge needs --base <config> or --csv <table>")
 
     if memos:
@@ -718,7 +905,16 @@ def cmd_diff_merge(args):
             cell = diff_cell(rec[3], rec[1], rec[2])
             if cell:
                 batch.append(
-                    [batch_id, now, out_sheet, CONFIG_PREFIX + rec[0], cell, note]
+                    [
+                        batch_id,
+                        now,
+                        base_commit,
+                        new_commit,
+                        out_sheet,
+                        CONFIG_PREFIX + rec[0],
+                        cell,
+                        note,
+                    ]
                 )
         if args.history and batch:
             append_history_csv(args.history, batch)
@@ -924,7 +1120,11 @@ def main(argv=None):
     p = sub.add_parser(
         "dump", help="dump .config entries to CSV (or .xlsx) with Kconfig metadata"
     )
-    p.add_argument("--config", required=True, help="path to .config")
+    p.add_argument(
+        "--config",
+        required=True,
+        help="path to .config (or a git rev <ref>[:<path>])",
+    )
     _add_kconfig_args(p, srcdir_required=True)
     p.add_argument("--memo", help="memo CSV to pre-fill the memo column")
     p.add_argument(
@@ -948,7 +1148,8 @@ def main(argv=None):
     p.add_argument(
         "--base",
         required=True,
-        help="original .config, or a dump table (.csv/.xlsx)",
+        help="original .config (or a git rev <ref>[:<path>]), or a dump table "
+        "(.csv/.xlsx)",
     )
     p.add_argument(
         "--base-sheet", help="sheet in the --base workbook (.xlsx only)"
@@ -956,10 +1157,18 @@ def main(argv=None):
     p.add_argument(
         "--new",
         required=True,
-        help="changed .config, or a dump table (.csv/.xlsx)",
+        help="changed .config (or a git rev <ref>[:<path>]), or a dump table "
+        "(.csv/.xlsx)",
     )
     p.add_argument(
         "--new-sheet", help="sheet in the --new workbook (.xlsx only)"
+    )
+    p.add_argument(
+        "--patch",
+        "-u",
+        action="store_true",
+        help="emit a git-style unified diff of the two configs to stdout "
+        "(needs .config inputs, not tables; exit 1 if there is a diff)",
     )
     _add_kconfig_args(p)
     p.set_defaults(func=cmd_diff)
@@ -970,13 +1179,18 @@ def main(argv=None):
     )
     p.add_argument(
         "--base",
-        help="original config (text .config); pairs with --new for the delta",
+        help="original config (text .config or a git rev <ref>[:<path>]); "
+        "pairs with --new for the delta",
     )
     p.add_argument(
         "--csv",
         help="dump table to use as the base and memo source (or use --base <config>)",
     )
-    p.add_argument("--new", required=True, help="changed config (text .config)")
+    p.add_argument(
+        "--new",
+        required=True,
+        help="changed config (text .config or a git rev <ref>[:<path>])",
+    )
     p.add_argument(
         "--memo",
         help="memo CSV to apply to the output (overrides table memos)",
