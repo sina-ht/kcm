@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Core dumps
+core
+
+# CSV output files (force-add with git add -f if needed)
+*.csv
+
+# Test data: large kernel source trees (keep testdata/config)
+testdata/linux-*/
