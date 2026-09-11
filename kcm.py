@@ -456,7 +456,7 @@ def append_history_csv(path, rows):
             "error: {} has an outdated history schema; regenerate it".format(path)
         )
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator="\n")
         if not exists:
             writer.writerow(HISTORY_COLUMNS)
         for batch, dt, base_commit, new_commit, sheet, name, diff, note in rows:
@@ -658,7 +658,7 @@ def write_table(path, rows, sheet=None, history=None, history_append=True):
         path, "w", newline="", encoding="utf-8"
     )
     try:
-        writer = csv.writer(out)
+        writer = csv.writer(out, lineterminator="\n")
         writer.writerow(COLUMNS)
         writer.writerows(rows)
     finally:
@@ -842,7 +842,7 @@ def _write_memo_csv(rows, path):
     name_i = COLUMNS.index("name")
     count = 0
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator="\n")
         writer.writerow(["name", "note"])
         for row in rows:
             note = row[memo_i].strip() if memo_i < len(row) else ""
@@ -1222,7 +1222,7 @@ def cmd_diff_split(args):
         args.output, "w", newline="", encoding="utf-8"
     )
     try:
-        writer = csv.writer(out)
+        writer = csv.writer(out, lineterminator="\n")
         writer.writerow(["name", "diff"])
         count = 0
         for row in rows:
@@ -1269,7 +1269,7 @@ def cmd_memo_split(args):
         args.output, "w", newline="", encoding="utf-8"
     )
     try:
-        writer = csv.writer(out)
+        writer = csv.writer(out, lineterminator="\n")
         writer.writerow(["name", "note"])
         count = 0
         for row in rows:
@@ -1318,7 +1318,7 @@ def cmd_history_split(args):
         args.output, "w", newline="", encoding="utf-8"
     )
     try:
-        writer = csv.writer(out)
+        writer = csv.writer(out, lineterminator="\n")
         writer.writerow(HISTORY_COLUMNS)
         count = 0
         for row in raw[1:]:
