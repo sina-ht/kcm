@@ -1,8 +1,8 @@
 # kcm — Linux kernel configuration management tool
 
-`kcm.py` dumps a kernel `.config` to CSV (with metadata parsed from the
+`kcm.py` dumps a kernel `config` to CSV (with metadata parsed from the
 Kconfig tree) for viewing or editing in spreadsheet apps such as Excel,
-reports the differences between two `.config` files, and manages per-config
+reports the differences between two `config` files, and manages per-config
 memos (annotations) and a change history in separate CSVs that persist
 across dumps. `commit` records the committed-to-working change and git-commits
 it in one step, and `history` pretty-prints the audit trail (with per-batch
@@ -27,22 +27,22 @@ pip install -r requirements.txt
 
 ## CSV format
 
-`dump` produces one row per config option found in the `.config` (in
-`.config` order, including `# CONFIG_FOO is not set` entries with value `n`):
+`dump` produces one row per config option found in the `config` (in
+`config` order, including `# CONFIG_FOO is not set` entries with value `n`):
 
 | column    | meaning                                                        |
 |-----------|----------------------------------------------------------------|
 | `name`    | `CONFIG_`-prefixed option name                                 |
 | `type`    | Kconfig type: `bool`, `tristate`, `string`, `int`, `hex`, `choice` |
 | `title`   | the Kconfig prompt text (e.g. `Local version - append to kernel release`) |
-| `value`   | value from the `.config` (`y`, `n`, number, or string without quotes) |
-| `diff`    | delta against another `.config` (filled by `diff-merge`); empty otherwise |
+| `value`   | value from the `config` (`y`, `n`, number, or string without quotes) |
+| `diff`    | delta against another `config` (filled by `diff-merge`); empty otherwise |
 | `default` | all Kconfig defaults, `;`-joined; conditional ones as `value if CONDITION` |
 | `depends` | full dependency expression, including enclosing `if` menu context. `<choice>` means "visible when the choice is" |
 | `memo`    | annotation from a memo CSV, or empty                           |
 
-Options present in the `.config` but not in the Kconfig tree (e.g. a newer
-`.config` against an older source tree) get an empty `type`; the count is
+Options present in the `config` but not in the Kconfig tree (e.g. a newer
+`config` against an older source tree) get an empty `type`; the count is
 reported on stderr.
 
 The same columns are used for `.xlsx` output (see [Excel workbooks](#excel-workbooks-xlsx)).
@@ -54,9 +54,9 @@ accept a **file path** or a **git rev**:
 
 - a path that exists on disk is used as-is;
 - otherwise the argument is a git rev, read via `git show`:
-  `HEAD:linux/.config`, `main:linux/.config`, `v6.5:linux/.config`, or a bare
+  `HEAD:config`, `main:config`, `v6.5:config`, or a bare
   `HEAD`/`main`/`@{upstream}` which borrows the path from the other operand
-  (so `--base HEAD --new linux/.config` reads `HEAD:linux/.config`).
+  (so `--base HEAD --new config` reads `HEAD:config`).
 
 Git runs from the **project root** (the directory of the discovered `.kcmrc`,
 or the current directory when there is none), so relative paths and `git show`
@@ -74,13 +74,13 @@ built-in default**. Commit it to the repo (it is project config).
 
 ```ini
 [kcm]
-config  = linux/.config      # the working .config (also the default --new)
-srcdir  = linux              # kernel source tree (contains Kconfig)
-xlsx    = kernel.xlsx        # the workbook (dump/diff-merge/commit output)
-memo    = memos.csv          # memo CSV (name,note)
-history = history.csv        # history CSV (the audit trail)
-# base    = HEAD:linux/.config   # default; equals HEAD:<config>
-# arch    = x86_64               # optional: arch / cc / ld
+config  = config         # the working config (also the default --new)
+srcdir  = ../linux       # kernel source tree (contains Kconfig)
+xlsx    = kernel.xlsx    # the workbook (dump/diff-merge/commit output)
+memo    = memos.csv      # memo CSV (name,note)
+history = history.csv    # history CSV (the audit trail)
+# base    = HEAD:config  # default; equals HEAD:<config>
+# arch    = x86_64       # optional: arch / cc / ld
 ```
 
 Keys: `config`, `srcdir`, `base`, `xlsx`, `sheet`, `memo`, `history`, and
@@ -92,23 +92,29 @@ defaults to `config`, and `--base` defaults to `HEAD:<config>` — so with a
 Control discovery with `--rc PATH` (use a specific file) or `--no-rc`
 (disable it).
 
+In the standard layout the **config repo is separate from the kernel source
+tree**: `srcdir` points across to the tree (a sibling directory, another repo,
+or a plain checkout) and only the config repo is version-controlled. See
+[WORKFLOW.md](WORKFLOW.md#layout-the-config-repo-is-separate-from-the-kernel-tree)
+for the end-to-end guide.
+
 ## Commands
 
 ### dump
 
-Parse a `.config` and a kernel source tree, write the CSV (or `.xlsx`).
+Parse a `config` and a kernel source tree, write the CSV (or `.xlsx`).
 
 ```sh
-python3 kcm.py dump --config .config --srcdir linux -o dump.csv
-python3 kcm.py dump --config .config --srcdir linux --memo memo.csv -o dump.csv
+python3 kcm.py dump --config config --srcdir ../linux -o dump.csv
+python3 kcm.py dump --config config --srcdir ../linux --memo memo.csv -o dump.csv
 # build the full workbook view from the text sources (memos + history)
-python3 kcm.py dump --config .config --srcdir linux --memo memo.csv \
+python3 kcm.py dump --config config --srcdir ../linux --memo memo.csv \
   --history history.csv -o book.xlsx
 ```
 
 | option     | default      | description                                          |
 |------------|--------------|------------------------------------------------------|
-| `--config` | (required)   | path to the `.config` file, or a git rev (see [Config inputs](#config-inputs-file-paths-or-git-revs)) |
+| `--config` | (required)   | path to the `config` file, or a git rev (see [Config inputs](#config-inputs-file-paths-or-git-revs)) |
 | `--srcdir` | (required)   | path to the kernel source tree (contains `Kconfig`)  |
 | `--memo`   | none         | memo CSV to pre-fill the `memo` column               |
 | `--history`| none         | history CSV to build the `History` sheet from (`.xlsx` only) |
@@ -120,22 +126,22 @@ python3 kcm.py dump --config .config --srcdir linux --memo memo.csv \
 
 `--arch`/`--cc`/`--ld` only affect parsing of the Kconfig tree (e.g.
 arch-specific `source` paths and `cc-option` probes); they do not change the
-values, which always come from the `.config`. `--history` replaces the
+values, which always come from the `config`. `--history` replaces the
 `History` sheet with the given CSV (it is a build, not an append); a memo
 entry with no matching config option is ignored with a warning on stderr.
 
 ### diff
 
-Report the differences between two `.config` files as a human-readable list
+Report the differences between two `config` files as a human-readable list
 on stdout (summary counts go to stderr). `--srcdir` appends the Kconfig title
 of each changed symbol.
 
 `--base`/`--new` accept file paths, git revs (see [Config inputs](#config-inputs-file-paths-or-git-revs)), or dump tables (`.csv` or `.xlsx`, detected by extension) — e.g. to compare two sheets of the same workbook:
 
 ```sh
-python3 kcm.py diff --base .config --new .config.new
-python3 kcm.py diff --base .config --new .config.new --srcdir linux
-python3 kcm.py diff --base HEAD:linux/.config --new linux/.config --srcdir linux
+python3 kcm.py diff --base config --new config.new
+python3 kcm.py diff --base config --new config.new --srcdir ../linux
+python3 kcm.py diff --base HEAD:config --new config --srcdir ../linux
 python3 kcm.py diff --base book.xlsx --base-sheet before \
                     --new book.xlsx --new-sheet after
 ```
@@ -153,13 +159,13 @@ removed (1):
 ### diff --patch
 
 With `--patch` (or `-u`), `diff` emits a git-style **unified diff** of the two
-configs on stdout instead of the report (both operands must be `.config`
+configs on stdout instead of the report (both operands must be `config`
 inputs, not tables). The counts still go to stderr, and the exit status is
 `1` when the configs differ, `0` when they are identical — so it is usable in
 scripts. The output is `git apply`-compatible (`a/`/`b/` path prefixes):
 
 ```sh
-python3 kcm.py diff --base HEAD:linux/.config --new linux/.config --patch > change.patch
+python3 kcm.py diff --base HEAD:config --new config --patch > change.patch
 git apply --check change.patch
 ```
 
@@ -182,16 +188,16 @@ history only.
 
 ```sh
 # git-native: record the change and append a history batch
-python3 kcm.py diff-merge --base .config --new .config.new --srcdir linux \
+python3 kcm.py diff-merge --base config --new config.new --srcdir ../linux \
   -o book.xlsx --history history.csv --history-note "trim attack surface"
 # git-native straight against HEAD (no temp file); the batch records the base commit
-python3 kcm.py diff-merge --base HEAD:linux/.config --new linux/.config --srcdir linux \
+python3 kcm.py diff-merge --base HEAD:config --new config --srcdir ../linux \
   -o book.xlsx --history history.csv --history-note "trim attack surface"
 # apply a memo CSV to the output
-python3 kcm.py diff-merge --base .config --new .config.new --memo memo.csv \
+python3 kcm.py diff-merge --base config --new config.new --memo memo.csv \
   -o dump.csv
 # table base (in place): base and memos come from the existing table
-python3 kcm.py diff-merge --csv book.xlsx --new .config.new \
+python3 kcm.py diff-merge --csv book.xlsx --new config.new \
   -o book.xlsx --out-sheet before
 ```
 
@@ -256,8 +262,8 @@ text sources. With a `.kcmrc` in place it takes only a note:
 # with .kcmrc (config/srcdir/memo/history all come from it)
 python3 kcm.py commit --note "trim attack surface"
 # fully explicit
-python3 kcm.py commit --config linux/.config --base HEAD:linux/.config \
-  --srcdir linux --memo memos.csv --history history.csv -o kernel.xlsx \
+python3 kcm.py commit --config config --base HEAD:config \
+  --srcdir ../linux --memo memos.csv --history history.csv -o kernel.xlsx \
   --note "REQ-1234: enable FIPS crypto support"
 ```
 
@@ -265,7 +271,7 @@ Behavior:
 
 - **No changes** (config matches the base) → prints a notice and exits `0`
   without touching anything (safe to re-run).
-- Commits the **text sources of truth** — the `.config`, `history.csv`, and
+- Commits the **text sources of truth** — the `config`, `history.csv`, and
   (if any memos) `memos.csv`. The commit message is the `--note` (or
   `Update <config>`) plus greppable trailers:
   ```
@@ -309,7 +315,7 @@ living Excel workbook (baseline, annotation, and change tracking), see
 
 ```sh
 # 1. Initial dump (no memos yet)
-python3 kcm.py dump --config .config --srcdir linux -o dump.csv
+python3 kcm.py dump --config config --srcdir ../linux -o dump.csv
 
 # 2. Open dump.csv in Excel, write notes in the memo column, save
 #    (keep the file as CSV so kcm can read it back)
@@ -317,8 +323,8 @@ python3 kcm.py dump --config .config --srcdir linux -o dump.csv
 # 3. Persist the notes
 python3 kcm.py memo-split --csv dump.csv -o memo.csv
 
-# 4. Later: re-dump after kernel source or .config changed, memos come back
-python3 kcm.py dump --config .config --srcdir linux --memo memo.csv -o dump.csv
+# 4. Later: re-dump after kernel source or config changed, memos come back
+python3 kcm.py dump --config config --srcdir ../linux --memo memo.csv -o dump.csv
 
 # 5. Or merge memos into an existing dump without re-parsing the tree
 python3 kcm.py memo-merge --csv dump.csv --memo memo.csv -o dump-annotated.csv
@@ -337,21 +343,22 @@ Duplicate names in a memo CSV: the last entry wins (a warning is printed).
 
 ## Diffing configs
 
-After re-generating a `.config` in the tree (e.g. via `make menuconfig`), the
-committed version at `HEAD` is the base and the working-tree file is the new
-state. Review and record what changed, straight against git (no temp files):
+After re-generating the `config` (run `make menuconfig` in the kernel tree,
+then copy the tree's `.config` into the config repo), the committed version at
+`HEAD` is the base and the working file is the new state. Review and record
+what changed, straight against git (no temp files):
 
 ```sh
 # 1. Review the delta (optionally with Kconfig titles)
-python3 kcm.py diff --base HEAD:linux/.config --new linux/.config --srcdir linux
+python3 kcm.py diff --base HEAD:config --new config --srcdir ../linux
 
 # 2. Record the delta: rebuild the table, fill the diff column,
 #    and append a history batch (base_commit is stamped automatically)
-python3 kcm.py diff-merge --base HEAD:linux/.config --new linux/.config \
-  --srcdir linux -o book.xlsx --history history.csv --history-note "..."
+python3 kcm.py diff-merge --base HEAD:config --new config \
+  --srcdir ../linux -o book.xlsx --history history.csv --history-note "..."
 
 # 3. Emit the change as a git-applicable patch (for review / PRs)
-python3 kcm.py diff --base HEAD:linux/.config --new linux/.config --patch > change.patch
+python3 kcm.py diff --base HEAD:config --new config --patch > change.patch
 
 # 4. Persist just the current delta as a standalone file
 python3 kcm.py diff-split --csv book.xlsx -o diff.csv
@@ -368,11 +375,11 @@ extension; `openpyxl` is required for these. A typical workflow keeps one
 workbook per project with one sheet per config snapshot:
 
 ```sh
-python3 kcm.py dump --config .config --srcdir linux -o book.xlsx --sheet before
+python3 kcm.py dump --config config --srcdir ../linux -o book.xlsx --sheet before
 # ... change the config ...
-python3 kcm.py dump --config .config.new --srcdir linux -o book.xlsx --sheet after
+python3 kcm.py dump --config config.new --srcdir ../linux -o book.xlsx --sheet after
 python3 kcm.py diff --base book.xlsx --base-sheet before --new book.xlsx --new-sheet after
-python3 kcm.py diff-merge --csv book.xlsx --sheet before --new .config.new \
+python3 kcm.py diff-merge --csv book.xlsx --sheet before --new config.new \
   -o book.xlsx --out-sheet before
 python3 kcm.py memo-split --csv book.xlsx --sheet after -o memo.csv
 ```
@@ -417,7 +424,7 @@ history CSV (`--history`):
 
 The commit columns link each batch back to `git`: `history show <batch> --patch`
 reconstructs the batch as a git patch (or do it by hand with
-`diff --base <base_commit>:linux/.config --new <next>:linux/.config --patch`).
+`diff --base <base_commit>:config --new <next>:config --patch`).
 Read the trail without Excel with `history log` (list) and `history show
 <batch>` (one batch's per-symbol changes) — see [history](#history).
 
