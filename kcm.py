@@ -1573,6 +1573,22 @@ def load_kcmrc(path):
     return {k: v for k, v in cp[RC_SECTION].items() if v.strip()}
 
 
+def _rc_bool(v, key):
+    """Parse a .kcmrc boolean value. None/empty -> None (unset); else True/False."""
+    if v is None or not v.strip():
+        return None
+    s = v.strip().lower()
+    if s in ("1", "true", "yes", "on", "y"):
+        return True
+    if s in ("0", "false", "no", "off", "n"):
+        return False
+    raise SystemExit(
+        "error: bad {} value for '{}': {!r} (expected true/false)".format(
+            RC_NAME, key, v
+        )
+    )
+
+
 def setup_project(args):
     """Resolve the project (rc + root) and chdir to the root. -> (rc, root).
 
@@ -1688,6 +1704,9 @@ def apply_project_defaults(args, rc):
             args.base = "HEAD:{}".format(args.config)
         args.sheet = args.sheet or d("sheet") or DEFAULT_SHEET
         args.xlsx = args.xlsx or d("xlsx")
+        if args.commit_xlsx is None:
+            args.commit_xlsx = _rc_bool(d("commit_xlsx"), "commit_xlsx")
+        args.commit_xlsx = bool(args.commit_xlsx)
         args.memo = args.memo or d("memo") or DEFAULT_MEMO
         args.history = args.history or d("history") or DEFAULT_HISTORY
         if not args.new:
@@ -1916,7 +1935,15 @@ def main(argv=None):
     p.add_argument(
         "--commit-xlsx",
         action="store_true",
+        default=None,
         help="also git-stage/commit the workbook (a derived binary; off by default)",
+    )
+    p.add_argument(
+        "--no-commit-xlsx",
+        action="store_false",
+        dest="commit_xlsx",
+        help="do not git-stage/commit the workbook (overrides 'commit_xlsx' in "
+        + RC_NAME,
     )
     p.add_argument(
         "--sheet",
