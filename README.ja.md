@@ -63,10 +63,12 @@ memo    = memos.csv      # メモ CSV (name,note)
 history = history.csv    # 履歴 CSV (監査証跡)
 # base    = HEAD:config  # デフォルト; HEAD:<config> に等しい
 # arch    = x86_64       # 任意: arch / cc / ld
+# commit_xlsx = true     # ワークブックも git コミットする (デフォルトはオフ)
 ```
 
-キー: `config`、`srcdir`、`base`、`xlsx`、`sheet`、`memo`、`history`、任意で
-`arch`/`cc`/`ld`。2つのデフォルトが自動計算される: `--new` はデフォルトで
+キー: `config`、`srcdir`、`base`、`xlsx`、`sheet`、`memo`、`history`、
+`commit_xlsx`、任意で `arch`/`cc`/`ld`。2つのデフォルトが自動計算される:
+`--new` はデフォルトで
 `config`、`--base` はデフォルトで `HEAD:<config>` — したがって `.kcmrc` が
 あるとき、`kcm diff`、`kcm diff-merge`、`kcm commit` はすべて「コミット済みの
 設定から作業中の変更」を意味する。
@@ -258,7 +260,8 @@ python3 kcm.py commit --config config --base HEAD:config \
   ```
 - ワークブックはパスが設定されている場合 (`-o`/`.kcmrc` の `xlsx`) に**ローカルに
   書き出される** (現在の表示として) が、デフォルトでは**コミットされない** —
-  派生バイナリだからである。ステージして一緒にコミットするには `--commit-xlsx` を付ける。
+  派生バイナリだからである。ステージして一緒にコミットするには `--commit-xlsx`
+  (または `.kcmrc` で `commit_xlsx = true`) を付ける。
 - `--no-git` はメモ/履歴/ワークブックを書き出して `git` をスキップ。`--no-memo`
   はメモ更新をスキップ。`--dry-run` は書き出さず/コミットせずに変更とファイルだけ
   報告。`--signoff`/`-s` は `Signed-off-by` を追加。

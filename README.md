@@ -81,10 +81,12 @@ memo    = memos.csv      # memo CSV (name,note)
 history = history.csv    # history CSV (the audit trail)
 # base    = HEAD:config  # default; equals HEAD:<config>
 # arch    = x86_64       # optional: arch / cc / ld
+# commit_xlsx = true     # also git-commit the workbook (off by default)
 ```
 
-Keys: `config`, `srcdir`, `base`, `xlsx`, `sheet`, `memo`, `history`, and
-optionally `arch`/`cc`/`ld`. Two defaults are computed for you: `--new`
+Keys: `config`, `srcdir`, `base`, `xlsx`, `sheet`, `memo`, `history`,
+`commit_xlsx`, and optionally `arch`/`cc`/`ld`. Two defaults are computed for
+you: `--new`
 defaults to `config`, and `--base` defaults to `HEAD:<config>` — so with a
 `.kcmrc` in place, `kcm diff`, `kcm diff-merge`, and `kcm commit` all mean
 "the change from the committed config to the working one".
@@ -281,7 +283,8 @@ Behavior:
   ```
 - The workbook is **written locally** (as the current view) when a path is set
   (`-o`/`.kcmrc` `xlsx`) but is **not** committed by default — it is a derived
-  binary. Add `--commit-xlsx` to stage and commit it too.
+  binary. Add `--commit-xlsx` (or set `commit_xlsx = true` in `.kcmrc`) to
+  stage and commit it too.
 - `--no-git` writes the memos/history/workbook but skips `git`; `--no-memo`
   skips the memo refresh; `--dry-run` reports the change and files without
   writing or committing; `--signoff`/`-s` adds `Signed-off-by`.
